@@ -91,6 +91,9 @@
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
+#include "llvm/SandboxIR/Context.h"
+#include "llvm/SandboxIR/Tracker.h"
+#include "llvm/SandboxIR/Function.h"
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -20793,6 +20796,9 @@ bool SLPVectorizerPass::runImpl(Function &F, ScalarEvolution *SE_,
   AC = AC_;
   DB = DB_;
   DL = &F.getDataLayout();
+
+  sandboxir::Context Ctx(F.getContext());
+  auto *SBF = Ctx.createFunction(F);
 
   Stores.clear();
   GEPs.clear();
