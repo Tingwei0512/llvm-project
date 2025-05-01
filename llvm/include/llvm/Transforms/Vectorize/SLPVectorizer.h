@@ -23,6 +23,9 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/SandboxIR/Context.h"
+#include "llvm/SandboxIR/Tracker.h"
+#include "llvm/SandboxIR/Function.h"
 
 namespace llvm {
 
@@ -106,7 +109,7 @@ private:
                       slpvectorizer::BoUpSLP &R);
 
   /// Vectorize the store instructions collected in Stores.
-  bool vectorizeStoreChains(slpvectorizer::BoUpSLP &R);
+  bool vectorizeStoreChains(slpvectorizer::BoUpSLP &R, sandboxir::Context &Ctx);
 
   /// Vectorize the index computations of the getelementptr instructions
   /// collected in GEPs.
@@ -155,12 +158,12 @@ private:
   std::optional<bool> vectorizeStoreChain(ArrayRef<Value *> Chain,
                                           slpvectorizer::BoUpSLP &R,
                                           unsigned Idx, unsigned MinVF,
-                                          unsigned &Size);
+                                          unsigned &Size, sandboxir::Context &Ctx);
 
   bool vectorizeStores(
       ArrayRef<StoreInst *> Stores, slpvectorizer::BoUpSLP &R,
       DenseSet<std::tuple<Value *, Value *, Value *, Value *, unsigned>>
-          &Visited);
+          &Visited, sandboxir::Context &Ctx);
 
   /// The store instructions in a basic block organized by base pointer.
   StoreListMap Stores;
