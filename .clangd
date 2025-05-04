@@ -1,0 +1,8 @@
+CompileFlags:
+    Add: [
+        -I/home/tomlord/workspace/llvm20/llvm-project/llvm/include/,
+    ]
+
+
+Diagnostics:
+  Suppress: '*'

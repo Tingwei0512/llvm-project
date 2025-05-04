@@ -113,6 +113,8 @@ using namespace std::placeholders;
 #define SV_NAME "slp-vectorizer"
 #define DEBUG_TYPE "SLP"
 
+bool UseSandboxIRForStores = false;
+
 STATISTIC(NumVectorInstructions, "Number of vector instructions generated");
 
 DEBUG_COUNTER(VectorizedGraphs, "slp-vectorized",
@@ -1798,7 +1800,7 @@ public:
   /// Vectorize the tree that starts with the elements in \p VL.
   /// Returns the vectorized root.
   Value *vectorizeTree();
-  Value *SBvectorizeTree();
+  Value *SBvectorizeTree(sandboxir::Context &Ctx);
   /// Vectorize the tree but with the list of externally used values \p
   /// ExternallyUsedValues. Values in this MapVector can be replaced but the
   /// generated extractvalue instructions.
@@ -1808,6 +1810,7 @@ public:
       ArrayRef<std::tuple<Value *, unsigned, bool>> VectorValuesAndScales = {});
   Value *SBvectorizeTree(
       const ExtraValueToDebugLocsMap &ExternallyUsedValues,
+      sandboxir::Context &Ctx,
       Instruction *ReductionRoot = nullptr,
       ArrayRef<std::tuple<Value *, unsigned, bool>> VectorValuesAndScales = {});
   /// \returns the cost incurred by unwanted spills and fills, caused by
@@ -3514,7 +3517,7 @@ private:
 
   /// Vectorize a single entry in the tree.
   Value *vectorizeTree(TreeEntry *E);
-  Value *SBvectorizeTree(TreeEntry *E);
+  Value *SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx);
   /// Returns vectorized operand node, that matches the order of the scalars
   /// operand number \p NodeIdx in entry \p E.
   TreeEntry *getMatchedVectorizedOperand(const TreeEntry *E, unsigned NodeIdx,
@@ -20264,8 +20267,9 @@ Value *BoUpSLP::vectorizeTree(
 
 Value *BoUpSLP::SBvectorizeTree(
     const ExtraValueToDebugLocsMap &ExternallyUsedValues,
+    sandboxir::Context &Ctx,
     Instruction *ReductionRoot,
-    ArrayRef<std::tuple<Value *, unsigned, bool>> VectorValuesAndScales, sandboxir::Context &Ctx) {
+    ArrayRef<std::tuple<Value *, unsigned, bool>> VectorValuesAndScales) {
   // Clean Entry-to-LastInstruction table. It can be affected after scheduling,
   // need to rebuild it.
   EntryToLastInstruction.clear();
@@ -22567,7 +22571,9 @@ bool SLPVectorizerPass::runImpl(Function &F, ScalarEvolution *SE_,
     if (!Stores.empty()) {
       LLVM_DEBUG(dbgs() << "SLP: Found stores for " << Stores.size()
                         << " underlying objects.\n");
+      UseSandboxIRForStores = true;
       Changed |= vectorizeStoreChains(R, Ctx);
+      UseSandboxIRForStores = false;
     }
 
     // Vectorize trees that end at reductions.
