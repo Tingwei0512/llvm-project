@@ -94,6 +94,8 @@
 #include "llvm/SandboxIR/Context.h"
 #include "llvm/SandboxIR/Tracker.h"
 #include "llvm/SandboxIR/Function.h"
+#include "llvm/SandboxIR/BasicBlock.h"
+#include "llvm/SandboxIR/Instruction.h"
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -20284,11 +20286,25 @@ Value *BoUpSLP::SBvectorizeTree(
     (void)getLastInstructionInBundle(TE.get());
   }
 
-  if (ReductionRoot)
-    Builder.SetInsertPoint(ReductionRoot->getParent(),
-                           ReductionRoot->getIterator());
-  else
-    Builder.SetInsertPoint(&F->getEntryBlock(), F->getEntryBlock().begin());
+  sandboxir::BasicBlock *SBInsertBB = nullptr; // may need to pass to further functions
+  sandboxir::BBIterator SBInsertPt; // may need to pass to further functions
+
+  if (ReductionRoot) {
+    if (UseSandboxIRForStores) {
+      SBInsertBB = cast_or_null<sandboxir::BasicBlock>(Ctx.getValue(ReductionRoot->getParent()));
+      SBInsertPt = cast_or_null<sandboxir::Instruction>(Ctx.getValue(ReductionRoot))->getIterator();
+    } else {
+      Builder.SetInsertPoint(ReductionRoot->getParent(),
+                             ReductionRoot->getIterator());
+    }
+  } else {
+    if (UseSandboxIRForStores) {
+      SBInsertBB = cast_or_null<sandboxir::BasicBlock>(Ctx.getValue(&F->getEntryBlock()));
+      SBInsertPt = SBInsertBB->begin();
+    } else {
+      Builder.SetInsertPoint(&F->getEntryBlock(), F->getEntryBlock().begin());
+    }
+  }
 
   // Emit gathered loads first to emit better code for the users of those
   // gathered loads.
