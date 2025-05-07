@@ -3615,6 +3615,9 @@ private:
   /// Set the Builder insert point to one after the last instruction in
   /// the bundle
   void setInsertPointAfterBundle(const TreeEntry *E);
+  // A sandbox ir version of setInsertPointAfterBundle()
+  std::pair<sandboxir::BasicBlock *, sandboxir::Instruction *> 
+  determineSBInsertPointForBundle(sandboxir::Context &Ctx, const TreeEntry *E);
 
   /// \returns a vector from a collection of scalars in \p VL. if \p Root is not
   /// specified, the starting vector value is poison.
@@ -16084,6 +16087,70 @@ void BoUpSLP::setInsertPointAfterBundle(const TreeEntry *E) {
   }
   Builder.SetCurrentDebugLocation(Front->getDebugLoc());
 }
+// sandbox ir version of setInsertPointAfterBundle()
+std::pair<sandboxir::BasicBlock *, sandboxir::Instruction *>
+BoUpSLP::determineSBInsertPointForBundle(sandboxir::Context &Ctx, const TreeEntry *E) {
+  llvm::Instruction *LastInst = &getLastInstructionInBundle(E);
+  assert(LastInst && "Failed to find last instruction in bundle");
+  llvm::BasicBlock *LLVMBB = LastInst->getParent();
+
+  // 2. 獲取對應的 Sandbox IR 基本塊
+  sandboxir::BasicBlock *SBTargetBB = cast_or_null<sandboxir::BasicBlock>(Ctx.getValue(LLVMBB));
+  
+  // 3. 決定 LLVM IR 層級的插入點 (在哪條指令之前插入)
+  llvm::Instruction *LLVMInsertBeforeInst = nullptr; // 預設為基本塊末尾
+
+  bool IsPHI = isa<PHINode>(LastInst);  
+
+  // 這段邏輯完全複製自 setInsertPointAfterBundle
+  if (IsPHI ||
+      (!E->isGather() && E->State != TreeEntry::SplitVectorize &&
+        doesNotNeedToSchedule(E->Scalars)) ||
+      (GatheredLoadsEntriesFirst.has_value() &&
+        E->Idx >= *GatheredLoadsEntriesFirst && !E->isGather() &&
+        E->getOpcode() == Instruction::Load)) {
+    
+    if (IsPHI) {
+      // 如果 LastInst 是 PHI，插入點在所有 PHI 之後，即第一個非 PHI 指令之前
+      llvm::BasicBlock::iterator It = LLVMBB->getFirstNonPHIIt();
+      // 處理 landing pad 的特殊情況
+      if (It != LLVMBB->end() && LLVMBB->isLandingPad()) {
+        It = std::next(It);
+      }
+      if (It != LLVMBB->end()) {
+        LLVMInsertBeforeInst = &*It;
+      }
+      // 如果 It == LLVMBB->end()，表示基本塊只包含 PHI 或在 PHI 後為空，
+      // LLVMInsertBeforeInst 保持 nullptr，新指令將插入到基本塊末尾。
+    } else {
+      // 如果 LastInst 不是 PHI，但滿足此分支條件，
+      // 原始碼中 Builder.SetInsertPoint(LastInst->getParent(), LastInst->getIterator());
+      // 這意味著新指令將插入在 LastInst 之前。
+      LLVMInsertBeforeInst = LastInst;
+    }
+  } else {
+    // 對應原始碼的 else 分支:
+    // Builder.SetInsertPoint(LastInst->getParent(), LastInst->getNextNonDebugInstruction()->getIterator());
+    // 這意味著新指令將插入在 LastInst 的下一個非 Debug 指令之前。
+    LLVMInsertBeforeInst = LastInst->getNextNonDebugInstruction();
+    // 如果 LastInst->getNextNonDebugInstruction() 返回 nullptr，
+    // 表示 LastInst 是基本塊中最後一條 "真實" 指令，
+    // LLVMInsertBeforeInst 保持 nullptr，新指令將插入到基本塊末尾。
+  }
+
+  // 4. 將 LLVM IR 插入點轉換為 Sandbox IR 插入點
+  sandboxir::Instruction *SBInsertBeforeInst = nullptr;
+  if (LLVMInsertBeforeInst) {
+    SBInsertBeforeInst = cast_or_null<sandboxir::Instruction>(Ctx.getValue(LLVMInsertBeforeInst));
+  }
+
+  // 5. 返回 Sandbox IR 的基本塊和插入點指令
+  // 注意：原始 setInsertPointAfterBundle 還會設定 DebugLoc：
+  // Builder.SetCurrentDebugLocation(Front->getDebugLoc());
+  // 在 Sandbox IR 中，DebugLoc 會在創建具體指令時直接傳遞給 Ctx.create<...>()。
+  // 所以此函數主要負責返回插入位置。
+  return {SBTargetBB, SBInsertBeforeInst};
+}
 
 Value *BoUpSLP::gather(
     ArrayRef<Value *> VL, Value *Root, Type *ScalarTy,
@@ -18540,7 +18607,7 @@ Value *BoUpSLP::vectorizeTree(TreeEntry *E) {
 }
 
 Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
-  IRBuilderBase::InsertPointGuard Guard(Builder);
+  IRBuilderBase::InsertPointGuard Guard(Builder); // 這樣好像不用pass insert point info(sandboxir::BasicBlock *SBInsertBB, sandboxir::BBIterator &SBInsertPt)?
 
   Value *V = E->Scalars.front();
   Type *ScalarTy = V->getType();
@@ -18571,13 +18638,13 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
     assert(OpTE1.isSame(
                ArrayRef(E->Scalars).take_front(OpTE1.getVectorFactor())) &&
            "Expected same first part of scalars.");
-    Value *Op1 = SBvectorizeTree(&OpTE1, Ctx);
+    Value *Op1 = SBvectorizeTree(&OpTE1, Ctx); // may need SBInsertBB, SBInsertPt
     TreeEntry &OpTE2 =
         *VectorizableTree[E->CombinedEntriesWithIndices.back().first].get();
     assert(
         OpTE2.isSame(ArrayRef(E->Scalars).take_back(OpTE2.getVectorFactor())) &&
         "Expected same second part of scalars.");
-    Value *Op2 = SBvectorizeTree(&OpTE2, Ctx);
+    Value *Op2 = SBvectorizeTree(&OpTE2, Ctx); // may need SBInsertBB, SBInsertPt
     auto GetOperandSignedness = [&](const TreeEntry *OpE) {
       bool IsSigned = false;
       auto It = MinBWs.find(OpE);
@@ -20315,7 +20382,7 @@ Value *BoUpSLP::SBvectorizeTree(
       assert((TE->UserTreeIndex ||
               (TE->getOpcode() == Instruction::Load && !TE->isGather())) &&
              "Expected gathered load node.");
-      (void)SBvectorizeTree(TE.get(), Ctx);
+      (void)SBvectorizeTree(TE.get(), Ctx);                   // 0505 here
     }
   }
   (void)SBvectorizeTree(VectorizableTree[0].get(), Ctx);
@@ -20353,7 +20420,7 @@ Value *BoUpSLP::SBvectorizeTree(
       Builder.SetInsertPoint(PrevVec);
     }
     Builder.SetCurrentDebugLocation(UserI->getDebugLoc());
-    Value *Vec = SBvectorizeTree(TE, Ctx);
+    Value *Vec = SBvectorizeTree(TE, Ctx); // may need SBInsertBB, SBInsertPt
     if (auto *VecI = dyn_cast<Instruction>(Vec);
         VecI && VecI->getParent() == Builder.GetInsertBlock() &&
         Builder.GetInsertPoint()->comesBefore(VecI))
