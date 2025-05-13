@@ -18626,21 +18626,21 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
     if (E->hasState() && E->Idx == 0 && !UserIgnoreList)
       setInsertPointAfterBundle(E);
     // --- set insert point for sandboxir ---
-    // llvm::BasicBlock *LlvmBB = Builder.GetInsertBlock();
-    // llvm::BasicBlock::iterator LlvmIt = Builder.GetInsertPoint();
+    llvm::BasicBlock *LlvmBB = Builder.GetInsertBlock();
+    llvm::BasicBlock::iterator LlvmIt = Builder.GetInsertPoint();
 
-    // sandboxir::BasicBlock *SbBB = dyn_cast_or_null<sandboxir::BasicBlock>(Ctx.getValue(LlvmBB));
-    // assert(SbBB && "Current BasicBlock not in SandboxIR Context");
+    sandboxir::BasicBlock *SbBB = dyn_cast_or_null<sandboxir::BasicBlock>(Ctx.getValue(LlvmBB));
+    assert(SbBB && "Current BasicBlock not in SandboxIR Context");
 
-    // sandboxir::BBIterator SbBIt;
-    // if (LlvmIt == LlvmBB->end()) {
-    //     SbBIt = SbBB->end();
-    // } else {
-    //     sandboxir::Instruction *SbBeforeInst = dyn_cast_or_null<sandboxir::Instruction>(Ctx.getValue(&*LlvmIt));
-    //     assert(SbBeforeInst && "Instruction at LLVM insert point not in SandboxIR context");
-    //     SbBIt = SbBeforeInst->getIterator();
-    // }
-    // sandboxir::InsertPosition SBInsertPos(SbBIt);
+    sandboxir::BBIterator SbBIt;
+    if (LlvmIt == LlvmBB->end()) {
+        SbBIt = SbBB->end();
+    } else {
+        sandboxir::Instruction *SbBeforeInst = dyn_cast_or_null<sandboxir::Instruction>(Ctx.getValue(&*LlvmIt));
+        assert(SbBeforeInst && "Instruction at LLVM insert point not in SandboxIR context");
+        SbBIt = SbBeforeInst->getIterator();
+    }
+    sandboxir::InsertPosition SBInsertPos(SbBIt);
     // --- end of set insert point for sandboxir ---
     Value *Vec = createBuildVector(E, ScalarTy);
     E->VectorizedValue = Vec;
