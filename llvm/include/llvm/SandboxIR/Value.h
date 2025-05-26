@@ -186,6 +186,9 @@ protected:
 
 public:
   virtual ~Value() = default;
+  // return the llvm value of this sandboxir value
+  llvm::Value *getLLVMValue() const { return Val; }
+  
   ClassID getSubclassID() const { return SubclassID; }
 
   using use_iterator = UserUseIterator;
