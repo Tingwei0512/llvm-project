@@ -1744,6 +1744,25 @@ getNumberOfParts(const TargetTransformInfo &TTI, VectorType *VecTy,
   return NumParts;
 }
 
+/// \returns the insert position in the sandboxir context for the given IRBuilder.
+static sandboxir::InsertPosition getSBInsertPosition(IRBuilderBase &Builder, sandboxir::Context &Ctx) {
+  llvm::BasicBlock *LlvmBB = Builder.GetInsertBlock();
+  llvm::BasicBlock::iterator LlvmIt = Builder.GetInsertPoint();
+
+  sandboxir::BasicBlock *SbBB = dyn_cast_or_null<sandboxir::BasicBlock>(Ctx.getValue(LlvmBB));
+  assert(SbBB && "Current BasicBlock not in SandboxIR Context");
+
+  sandboxir::BBIterator SbBIt;
+  if (LlvmIt == LlvmBB->end()) {
+      SbBIt = SbBB->end();
+  } else {
+      sandboxir::Instruction *SbBeforeInst = dyn_cast_or_null<sandboxir::Instruction>(Ctx.getValue(&*LlvmIt));
+      assert(SbBeforeInst && "Instruction at LLVM insert point not in SandboxIR context");
+      SbBIt = SbBeforeInst->getIterator();
+  }
+  return sandboxir::InsertPosition(SbBIt);
+}
+
 namespace slpvectorizer {
 
 /// Bottom Up SLP Vectorizer.
@@ -16886,32 +16905,42 @@ class BoUpSLP::SBShuffleInstructionBuilder final : public BaseShuffleAnalysis {
         : Builder(Builder), Ctx(Ctx), GatherShuffleExtractSeq(GatherShuffleExtractSeq),
           CSEBlocks(CSEBlocks), DL(DL) {}
     ~ShuffleIRBuilder() = default;
+
+    sandboxir::InsertPosition getSBIP() {
+      return getSBInsertPosition(Builder, Ctx);
+    }
+
     /// Creates shufflevector for the 2 operands with the given mask.
     Value *createShuffleVector(Value *V1, Value *V2, ArrayRef<int> Mask) {
       // first set the insert point for sandboxir
-      llvm::BasicBlock *LlvmBB = Builder.GetInsertBlock();
-      llvm::BasicBlock::iterator LlvmIt = Builder.GetInsertPoint();
+      // llvm::BasicBlock *LlvmBB = Builder.GetInsertBlock();
+      // llvm::BasicBlock::iterator LlvmIt = Builder.GetInsertPoint();
 
-      sandboxir::BasicBlock *SbBB = dyn_cast_or_null<sandboxir::BasicBlock>(Ctx.getValue(LlvmBB));
-      assert(SbBB && "Current BasicBlock not in SandboxIR Context");
+      // sandboxir::BasicBlock *SbBB = dyn_cast_or_null<sandboxir::BasicBlock>(Ctx.getValue(LlvmBB));
+      // assert(SbBB && "Current BasicBlock not in SandboxIR Context");
 
-      sandboxir::BBIterator SbBIt;
-      if (LlvmIt == LlvmBB->end()) {
-          SbBIt = SbBB->end();
-      } else {
-          sandboxir::Instruction *SbBeforeInst = dyn_cast_or_null<sandboxir::Instruction>(Ctx.getValue(&*LlvmIt));
-          assert(SbBeforeInst && "Instruction at LLVM insert point not in SandboxIR context");
-          SbBIt = SbBeforeInst->getIterator();
-      }
-      sandboxir::InsertPosition SBInsertPos(SbBIt);
+      // sandboxir::BBIterator SbBIt;
+      // if (LlvmIt == LlvmBB->end()) {
+      //     SbBIt = SbBB->end();
+      // } else {
+      //     sandboxir::Instruction *SbBeforeInst = dyn_cast_or_null<sandboxir::Instruction>(Ctx.getValue(&*LlvmIt));
+      //     assert(SbBeforeInst && "Instruction at LLVM insert point not in SandboxIR context");
+      //     SbBIt = SbBeforeInst->getIterator();
+      // }
+      // sandboxir::InsertPosition SBInsertPos(SbBIt);
       // end of setting the insert point
       // get sandboxir value and type
+      // sandboxir::Value *SBV1 = Ctx.getValue(V1);
+      // sandboxir::Value *SBV2 = Ctx.getValue(V2);
+      // sandboxir::Type *SBV1Ty = SBV1->getType();
+      // sandboxir::Type *SBV2Ty = SBV2->getType();
+      
+      // end of getting sandboxir value and type
+      sandboxir::InsertPosition SBIP = getSBIP();
       sandboxir::Value *SBV1 = Ctx.getValue(V1);
       sandboxir::Value *SBV2 = Ctx.getValue(V2);
       sandboxir::Type *SBV1Ty = SBV1->getType();
       sandboxir::Type *SBV2Ty = SBV2->getType();
-      
-      // end of getting sandboxir value and type
       if (V1->getType() != V2->getType()) {
         assert(V1->getType()->isIntOrIntVectorTy() &&
                V1->getType()->isIntOrIntVectorTy() &&
@@ -16921,20 +16950,66 @@ class BoUpSLP::SBShuffleInstructionBuilder final : public BaseShuffleAnalysis {
                   ->getElementType()
                   ->getIntegerBitWidth() < cast<VectorType>(V1->getType())
                                                ->getElementType()
-                                               ->getIntegerBitWidth())
-            V2 = Builder.CreateIntCast(
-                V2, V1->getType(), !isKnownNonNegative(V2, SimplifyQuery(DL)));
-          else
-            V1 = Builder.CreateIntCast(
-                V1, V2->getType(), !isKnownNonNegative(V1, SimplifyQuery(DL)));
+                                               ->getIntegerBitWidth()) {
+            // Do createintcast in sandboxir
+            // Fix it: we haven't consider const folding for now in sbir
+            bool IsSigned = !isKnownNonNegative(V2, SimplifyQuery(DL));
+            sandboxir::Instruction::Opcode castOp = 
+              V2->getType()->getScalarSizeInBits() > V1->getType()->getScalarSizeInBits() ?
+              sandboxir::Instruction::Opcode::Trunc :
+              (IsSigned ? sandboxir::Instruction::Opcode::SExt : sandboxir::Instruction::Opcode::ZExt);
+            sandboxir::Value* sbcast_V2 = sandboxir::CastInst::create(SBV1Ty, castOp, SBV2, SBIP, Ctx);
+            llvm::Instruction llvm_sbcast_V2 = dyn_cast<llvm::Instruction>(sbcast_V2->getLLVMValue());
+            if (llvm_sbcast_V2) {
+              if (isa<FPMathOperator>(llvm_sbcast_V2)) {
+                llvm_sbcast_V2->setFastMathFlags(Builder.getFastMathFlags());
+              }
+              for (const auto &MD : Builder.MetadataToCopy) {
+                llvm_sbcast_V2->setMetadata(MD.first, MD.second);
+              }
+            }
+            SBV2 = sbcast_V2;
+          } else {
+            // Do createintcast in sandboxir
+            bool IsSigned = !isKnownNonNegative(V1, SimplifyQuery(DL));
+            sandboxir::Instruction::Opcode castOp = 
+              V1->getType()->getScalarSizeInBits() > V2->getType()->getScalarSizeInBits() ?
+              sandboxir::Instruction::Opcode::Trunc :
+              (IsSigned ? sandboxir::Instruction::Opcode::SExt : sandboxir::Instruction::Opcode::ZExt);
+            sandboxir::Value* sbcast_V1 = sandboxir::CastInst::create(SBV2Ty, castOp, SBV1, SBIP, Ctx);
+            llvm::Instruction llvm_sbcast_V1 = dyn_cast<llvm::Instruction>(sbcast_V1->getLLVMValue());
+            if (llvm_sbcast_V1) {
+              if (isa<FPMathOperator>(llvm_sbcast_V1)) {
+                llvm_sbcast_V1->setFastMathFlags(Builder.getFastMathFlags());
+              }
+              for (const auto &MD : Builder.MetadataToCopy) {
+                llvm_sbcast_V1->setMetadata(MD.first, MD.second);
+              }
+            }
+            SBV1 = sbcast_V1;
+          }
+            // V2 = Builder.CreateIntCast(
+            //     V2, V1->getType(), !isKnownNonNegative(V2, SimplifyQuery(DL)));
+          // else
+          //   V1 = Builder.CreateIntCast(
+          //       V1, V2->getType(), !isKnownNonNegative(V1, SimplifyQuery(DL)));
         }
       }
-      Value *Vec = Builder.CreateShuffleVector(V1, V2, Mask);
-      if (auto *I = dyn_cast<Instruction>(Vec)) {
-        GatherShuffleExtractSeq.insert(I);
-        CSEBlocks.insert(I->getParent());
+      sandboxir::InsertPosition SBIP = getSBIP();
+      sandboxir::ShuffleVectorInst *SBShuffle = sandboxir::ShuffleVectorInst::create(SBV1, SBV2, Mask, SBIP, Ctx);
+      llvm::Instruction *llvm_sbshuffle = dyn_cast<llvm::Instruction>(SBShuffle->getLLVMValue());
+      if (llvm_sbshuffle) {
+        GatherShuffleExtractSeq.insert(llvm_sbshuffle);
+        CSEBlocks.insert(llvm_sbshuffle->getParent());
       }
-      return Vec;
+      return llvm_sbshuffle;
+
+      // Value *Vec = Builder.CreateShuffleVector(V1, V2, Mask);
+      // if (auto *I = dyn_cast<Instruction>(Vec)) {
+      //   GatherShuffleExtractSeq.insert(I);
+      //   CSEBlocks.insert(I->getParent());
+      // }
+      // return Vec;
     }
     /// Creates permutation of the single vector operand with the given mask, if
     /// it is not identity mask.
