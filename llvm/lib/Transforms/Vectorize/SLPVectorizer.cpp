@@ -71,6 +71,7 @@
 #include "llvm/IR/User.h"
 #include "llvm/IR/Value.h"
 #include "llvm/IR/ValueHandle.h"
+#include "llvm/SandboxIR/Value.h"
 #ifdef EXPENSIVE_CHECKS
 #include "llvm/IR/Verifier.h"
 #endif
@@ -16911,6 +16912,7 @@ class BoUpSLP::SBShuffleInstructionBuilder final : public BaseShuffleAnalysis {
     }
 
     /// Creates shufflevector for the 2 operands with the given mask.
+    // use sandbox ir to create shuffle vector instruction then return the corresponding llvm instruction
     Value *createShuffleVector(Value *V1, Value *V2, ArrayRef<int> Mask) {
       // first set the insert point for sandboxir
       // llvm::BasicBlock *LlvmBB = Builder.GetInsertBlock();
@@ -16959,16 +16961,14 @@ class BoUpSLP::SBShuffleInstructionBuilder final : public BaseShuffleAnalysis {
               sandboxir::Instruction::Opcode::Trunc :
               (IsSigned ? sandboxir::Instruction::Opcode::SExt : sandboxir::Instruction::Opcode::ZExt);
             sandboxir::Value* sbcast_V2 = sandboxir::CastInst::create(SBV1Ty, castOp, SBV2, SBIP, Ctx);
-            llvm::Instruction llvm_sbcast_V2 = dyn_cast<llvm::Instruction>(sbcast_V2->getLLVMValue());
+            llvm::Instruction* llvm_sbcast_V2 = dyn_cast<llvm::Instruction>(sbcast_V2->getLLVMValue());
             if (llvm_sbcast_V2) {
               if (isa<FPMathOperator>(llvm_sbcast_V2)) {
                 llvm_sbcast_V2->setFastMathFlags(Builder.getFastMathFlags());
               }
-              for (const auto &MD : Builder.MetadataToCopy) {
-                llvm_sbcast_V2->setMetadata(MD.first, MD.second);
-              }
+              Builder.AddMetadataToInst(llvm_sbcast_V2);
             }
-            SBV2 = sbcast_V2;
+            V2 = llvm_sbcast_V2;
           } else {
             // Do createintcast in sandboxir
             bool IsSigned = !isKnownNonNegative(V1, SimplifyQuery(DL));
@@ -16977,16 +16977,14 @@ class BoUpSLP::SBShuffleInstructionBuilder final : public BaseShuffleAnalysis {
               sandboxir::Instruction::Opcode::Trunc :
               (IsSigned ? sandboxir::Instruction::Opcode::SExt : sandboxir::Instruction::Opcode::ZExt);
             sandboxir::Value* sbcast_V1 = sandboxir::CastInst::create(SBV2Ty, castOp, SBV1, SBIP, Ctx);
-            llvm::Instruction llvm_sbcast_V1 = dyn_cast<llvm::Instruction>(sbcast_V1->getLLVMValue());
+            llvm::Instruction* llvm_sbcast_V1 = dyn_cast<llvm::Instruction>(sbcast_V1->getLLVMValue());
             if (llvm_sbcast_V1) {
               if (isa<FPMathOperator>(llvm_sbcast_V1)) {
                 llvm_sbcast_V1->setFastMathFlags(Builder.getFastMathFlags());
               }
-              for (const auto &MD : Builder.MetadataToCopy) {
-                llvm_sbcast_V1->setMetadata(MD.first, MD.second);
-              }
+              Builder.AddMetadataToInst(llvm_sbcast_V1);
             }
-            SBV1 = sbcast_V1;
+            V1 = llvm_sbcast_V1;
           }
             // V2 = Builder.CreateIntCast(
             //     V2, V1->getType(), !isKnownNonNegative(V2, SimplifyQuery(DL)));
@@ -16995,8 +16993,8 @@ class BoUpSLP::SBShuffleInstructionBuilder final : public BaseShuffleAnalysis {
           //       V1, V2->getType(), !isKnownNonNegative(V1, SimplifyQuery(DL)));
         }
       }
-      sandboxir::InsertPosition SBIP = getSBIP();
-      sandboxir::ShuffleVectorInst *SBShuffle = sandboxir::ShuffleVectorInst::create(SBV1, SBV2, Mask, SBIP, Ctx);
+      SBIP = getSBIP();
+      sandboxir::Value *SBShuffle = sandboxir::ShuffleVectorInst::create(SBV1, SBV2, Mask, SBIP, Ctx);
       llvm::Instruction *llvm_sbshuffle = dyn_cast<llvm::Instruction>(SBShuffle->getLLVMValue());
       if (llvm_sbshuffle) {
         GatherShuffleExtractSeq.insert(llvm_sbshuffle);
@@ -17013,6 +17011,7 @@ class BoUpSLP::SBShuffleInstructionBuilder final : public BaseShuffleAnalysis {
     }
     /// Creates permutation of the single vector operand with the given mask, if
     /// it is not identity mask.
+    // use sandbox ir to create shuffle vector instruction then return the corresponding llvm instruction
     Value *createShuffleVector(Value *V1, ArrayRef<int> Mask) {
       if (Mask.empty())
         return V1;
@@ -17020,12 +17019,22 @@ class BoUpSLP::SBShuffleInstructionBuilder final : public BaseShuffleAnalysis {
       unsigned LocalVF = cast<FixedVectorType>(V1->getType())->getNumElements();
       if (VF == LocalVF && ShuffleVectorInst::isIdentityMask(Mask, VF))
         return V1;
-      Value *Vec = Builder.CreateShuffleVector(V1, Mask);
-      if (auto *I = dyn_cast<Instruction>(Vec)) {
-        GatherShuffleExtractSeq.insert(I);
-        CSEBlocks.insert(I->getParent());
+      sandboxir::InsertPosition SBIP = getSBIP();
+      sandboxir::Value *sbV1 = Ctx.getValue(V1);
+      sandboxir::Value *sbV2_poison = sandboxir::PoisonValue::get(sbV1->getType());
+      sandboxir::Value *SBShuffle = sandboxir::ShuffleVectorInst::create(sbV1, sbV2_poison, Mask, SBIP, Ctx);
+      llvm::Instruction *llvm_sbshuffle = dyn_cast<llvm::Instruction>(SBShuffle->getLLVMValue());
+      if (llvm_sbshuffle) {
+        GatherShuffleExtractSeq.insert(llvm_sbshuffle);
+        CSEBlocks.insert(llvm_sbshuffle->getParent());
       }
-      return Vec;
+      return llvm_sbshuffle;
+      // Value *Vec = Builder.CreateShuffleVector(V1, Mask);
+      // if (auto *I = dyn_cast<Instruction>(Vec)) {
+      //   GatherShuffleExtractSeq.insert(I);
+      //   CSEBlocks.insert(I->getParent());
+      // }
+      // return Vec;
     }
     Value *createIdentity(Value *V) { return V; }
     Value *createPoison(Type *Ty, unsigned VF) {
@@ -17044,11 +17053,21 @@ class BoUpSLP::SBShuffleInstructionBuilder final : public BaseShuffleAnalysis {
       std::iota(IdentityMask.begin(), std::next(IdentityMask.begin(), MinVF),
                 0);
       Value *&Op = MinVF == V1VF ? V1 : V2;
-      Op = Builder.CreateShuffleVector(Op, IdentityMask);
-      if (auto *I = dyn_cast<Instruction>(Op)) {
-        GatherShuffleExtractSeq.insert(I);
-        CSEBlocks.insert(I->getParent());
+      sandboxir::InsertPosition SBIP = getSBIP();
+      sandboxir::Value *sbOp = Ctx.getValue(Op);
+      sandboxir::Value *sbOp_poison = sandboxir::PoisonValue::get(sbOp->getType());
+      sandboxir::Value *SBShuffle = sandboxir::ShuffleVectorInst::create(sbOp, sbOp_poison, IdentityMask, SBIP, Ctx);
+      llvm::Instruction *llvm_sbshuffle = dyn_cast<llvm::Instruction>(SBShuffle->getLLVMValue());
+      if (llvm_sbshuffle) {
+        GatherShuffleExtractSeq.insert(llvm_sbshuffle);
+        CSEBlocks.insert(llvm_sbshuffle->getParent());
       }
+      Op = llvm_sbshuffle;
+      // Op = Builder.CreateShuffleVector(Op, IdentityMask);
+      // if (auto *I = dyn_cast<Instruction>(Op)) {
+      //   GatherShuffleExtractSeq.insert(I);
+      //   CSEBlocks.insert(I->getParent());
+      // }
       if (MinVF == V1VF)
         V1 = Op;
       else
@@ -17081,8 +17100,8 @@ class BoUpSLP::SBShuffleInstructionBuilder final : public BaseShuffleAnalysis {
   }
 
 public:
-  ShuffleInstructionBuilder(Type *ScalarTy, IRBuilderBase &Builder, BoUpSLP &R)
-      : BaseShuffleAnalysis(ScalarTy), Builder(Builder), R(R) {}
+  SBShuffleInstructionBuilder(Type *ScalarTy, IRBuilderBase &Builder, BoUpSLP &R, sandboxir::Context &Ctx)
+      : BaseShuffleAnalysis(ScalarTy), Builder(Builder), R(R), Ctx(Ctx) {}
 
   /// Adjusts extractelements after reusing them.
   Value *adjustExtracts(const TreeEntry *E, MutableArrayRef<int> Mask,
@@ -17485,7 +17504,7 @@ public:
     return createShuffle(InVectors.front(), nullptr, CommonMask);
   }
 
-  ~ShuffleInstructionBuilder() {
+  ~SBShuffleInstructionBuilder() {
     assert((IsFinalized || CommonMask.empty()) &&
            "Shuffle construction must be finalized.");
   }
