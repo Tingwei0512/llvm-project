@@ -71,6 +71,7 @@
 #include "llvm/IR/User.h"
 #include "llvm/IR/Value.h"
 #include "llvm/IR/ValueHandle.h"
+#include "llvm/SandboxIR/Type.h"
 #include "llvm/SandboxIR/Value.h"
 #ifdef EXPENSIVE_CHECKS
 #include "llvm/IR/Verifier.h"
@@ -1746,23 +1747,23 @@ getNumberOfParts(const TargetTransformInfo &TTI, VectorType *VecTy,
 }
 
 /// \returns the insert position in the sandboxir context for the given IRBuilder.
-static sandboxir::InsertPosition getSBInsertPosition(IRBuilderBase &Builder, sandboxir::Context &Ctx) {
-  llvm::BasicBlock *LlvmBB = Builder.GetInsertBlock();
-  llvm::BasicBlock::iterator LlvmIt = Builder.GetInsertPoint();
+// static sandboxir::InsertPosition getSBInsertPosition(IRBuilderBase &Builder, sandboxir::Context &Ctx) {
+//   llvm::BasicBlock *LlvmBB = Builder.GetInsertBlock();
+//   llvm::BasicBlock::iterator LlvmIt = Builder.GetInsertPoint();
 
-  sandboxir::BasicBlock *SbBB = dyn_cast_or_null<sandboxir::BasicBlock>(Ctx.getValue(LlvmBB));
-  assert(SbBB && "Current BasicBlock not in SandboxIR Context");
+//   sandboxir::BasicBlock *SbBB = dyn_cast_or_null<sandboxir::BasicBlock>(Ctx.getValue(LlvmBB));
+//   assert(SbBB && "Current BasicBlock not in SandboxIR Context");
 
-  sandboxir::BBIterator SbBIt;
-  if (LlvmIt == LlvmBB->end()) {
-      SbBIt = SbBB->end();
-  } else {
-      sandboxir::Instruction *SbBeforeInst = dyn_cast_or_null<sandboxir::Instruction>(Ctx.getValue(&*LlvmIt));
-      assert(SbBeforeInst && "Instruction at LLVM insert point not in SandboxIR context");
-      SbBIt = SbBeforeInst->getIterator();
-  }
-  return sandboxir::InsertPosition(SbBIt);
-}
+//   sandboxir::BBIterator SbBIt;
+//   if (LlvmIt == LlvmBB->end()) {
+//       SbBIt = SbBB->end();
+//   } else {
+//       sandboxir::Instruction *SbBeforeInst = dyn_cast_or_null<sandboxir::Instruction>(Ctx.getValue(&*LlvmIt));
+//       assert(SbBeforeInst && "Instruction at LLVM insert point not in SandboxIR context");
+//       SbBIt = SbBeforeInst->getIterator();
+//   }
+//   return sandboxir::InsertPosition(SbBIt);
+// }
 
 namespace slpvectorizer {
 
@@ -3375,6 +3376,179 @@ public:
     }
   }
 
+  // sandboxir version of removeInstructionsAndOperands
+  template <typename T>
+  void SBremoveInstructionsAndOperands(
+      sandboxir::Context &Ctx,
+      ArrayRef<T *> DeadVals,
+      ArrayRef<std::tuple<Value *, unsigned, bool>> VectorValuesAndScales) {
+    SmallVector<WeakTrackingVH> DeadInsts;
+    LLVM_DEBUG(dbgs() << "@@SLP3 "<< ".\n");
+    for (T *V : DeadVals) {
+      auto *I = cast<Instruction>(V);
+      eraseInstruction(I);
+    }
+    LLVM_DEBUG(dbgs() << "@@SLP4 "<< ".\n");
+    DenseSet<Value *> Processed;
+    for (T *V : DeadVals) {
+      if (!V || !Processed.insert(V).second)
+        continue;
+      auto *I = cast<Instruction>(V);
+      salvageDebugInfo(*I);
+      ArrayRef<TreeEntry *> Entries = getTreeEntries(I);
+      for (Use &U : I->operands()) {
+        if (auto *OpI = dyn_cast_if_present<Instruction>(U.get());
+            OpI && !DeletedInstructions.contains(OpI) && OpI->hasOneUser() &&
+            wouldInstructionBeTriviallyDead(OpI, TLI) &&
+            (Entries.empty() || none_of(Entries, [&](const TreeEntry *Entry) {
+               return Entry->VectorizedValue == OpI;
+             })))
+          DeadInsts.push_back(OpI);
+        LLVM_DEBUG(dbgs() << "@@SLP5 "<< ".\n");
+      }
+      // I->dropAllReferences();
+      // Do it in a sandboxir way
+      // Note: gemini insists that we need to copy the operands,
+      // but i can't understand why.
+      // sandboxir::Instruction *SBI = cast<sandboxir::Instruction>(Ctx.getValue(I));
+      // for (sandboxir::Use &SBU : SBI->operands()) {
+      //   SBU.set(nullptr);
+      // }
+      // maybe i understand, let's first copy the operands
+      // Ctx.dumpMap();
+      if (!Ctx.getValue(I)) {
+        // Ctx.registerInstruction(I);
+        // LLVM_DEBUG(dbgs() << "@@SLP6.1 "<< ".\n");
+        LLVM_DEBUG(dbgs() << "@@SLP6.1: Ctx.getValue(I) is null for I:\n");
+        LLVM_DEBUG(I->dump());
+        if (I->getParent()) {
+          LLVM_DEBUG(dbgs() << "... in basic block: "
+                            << I->getParent()->getName() << "\n");
+          LLVM_DEBUG(dbgs() << "... in function: "
+                            << I->getParent()->getParent()->getName() << "\n");
+        } else {
+          LLVM_DEBUG(dbgs() << "... instruction has no parent basic block.\n");
+        }
+      }
+      sandboxir::Instruction *SBI =
+          cast<sandboxir::Instruction>(Ctx.getValue(I));
+      LLVM_DEBUG(dbgs() << "@@SLP6 "<< ".\n");
+
+      SmallVector<sandboxir::Use, 8> OperandsToProcess;
+      for (auto &&U : SBI->operands()) {
+        OperandsToProcess.push_back(U);
+      }
+      LLVM_DEBUG(dbgs() << "@@SLP7 "<< ".\n");
+      // for (sandboxir::Use &SBU : OperandsToProcess) {
+      //   SBU.set(nullptr);
+      // }
+      while (!OperandsToProcess.empty()) {
+        OperandsToProcess.pop_back_val().set(nullptr);
+        LLVM_DEBUG(dbgs() << "@@SLP8.1 "<< ".\n");
+      }
+      LLVM_DEBUG(dbgs() << "@@SLP8 "<< ".\n");
+    }
+    LLVM_DEBUG(dbgs() << "@@SLP9 "<< ".\n");
+    for (T *V : DeadVals) {
+      auto *I = cast<Instruction>(V);
+      LLVM_DEBUG(dbgs() << "@@SLP10 "<< ".\n");
+      if (!I->getParent())
+        continue;
+      assert((I->use_empty() || all_of(I->uses(),
+                                       [&](Use &U) {
+                                         return isDeleted(
+                                             cast<Instruction>(U.getUser()));
+                                       })) &&
+             "trying to erase instruction with users.");
+      // I->removeFromParent();
+      // Do it in a sandboxir way
+      sandboxir::Instruction *SBI = cast<sandboxir::Instruction>(Ctx.getValue(I));
+      LLVM_DEBUG(dbgs() << "@@SLP11 "<< ".\n");
+      SBI->removeFromParent();
+      SE->forgetValue(I);
+    }
+    // Process the dead instruction list until empty.
+    while (!DeadInsts.empty()) {
+      Value *V = DeadInsts.pop_back_val();
+      Instruction *VI = cast_or_null<Instruction>(V);
+      if (!VI || !VI->getParent())
+        continue;
+      assert(isInstructionTriviallyDead(VI, TLI) &&
+             "Live instruction found in dead worklist!");
+      assert(VI->use_empty() && "Instructions with uses are not dead.");
+
+      // Don't lose the debug info while deleting the instructions.
+      salvageDebugInfo(*VI);
+
+      // Null out all of the instruction's operands to see if any operand
+      // becomes dead as we go.
+
+      // Do it in a sandboxir way
+      sandboxir::Instruction *SBI = cast<sandboxir::Instruction>(Ctx.getValue(VI));
+      LLVM_DEBUG(dbgs() << "@@SLP12 "<< ".\n");
+      SmallVector<sandboxir::Use, 8> OperandsToProcess;
+      for (auto &&U : SBI->operands()) {
+        OperandsToProcess.push_back(U);
+      }
+      for (sandboxir::Use &OpU : OperandsToProcess) {
+        sandboxir::Value *OpV = OpU.get();
+        if (!OpV)
+          continue;
+        
+        // This modification is now safe and traceable.
+        OpU.set(nullptr);
+
+        if (!OpV->use_empty())
+          continue;
+
+        // If the operand is an instruction that became dead as we nulled out
+        // the operand, and if it is 'trivially' dead, delete it in a future
+        // loop iteration.
+        if (auto *OpSBInst = dyn_cast<sandboxir::Instruction>(OpV)) {
+          if (auto *OpI = dyn_cast<Instruction>(OpSBInst->getLLVMValue())) {
+            if (!DeletedInstructions.contains(OpI) &&
+                (!OpI->getType()->isVectorTy() ||
+                 none_of(VectorValuesAndScales,
+                         [&](const std::tuple<Value *, unsigned, bool> &V) {
+                           return std::get<0>(V) == OpI;
+                         })) &&
+                isInstructionTriviallyDead(OpI, TLI))
+              DeadInsts.push_back(OpI);
+          }
+        }
+      }
+      // 1. First, collect copies of the Use objects into a stable container.
+      // for (sandboxir::Use &OpU : SBI->operands()) {
+      //   sandboxir::Value *OpV = OpU.get();
+      //   if (!OpV)
+      //     continue;
+      //   OpU.set(nullptr);
+
+      //   if (!OpV->use_empty())
+      //     continue;
+
+      //   // If the operand is an instruction that became dead as we nulled out
+      //   // the operand, and if it is 'trivially' dead, delete it in a future
+      //   // loop iteration.
+      //   if (auto *OpI = dyn_cast<sandboxir::Instruction>(OpV)->getLLVMInstrs())
+      //     if (!DeletedInstructions.contains(OpI) &&
+      //         (!OpI->getType()->isVectorTy() ||
+      //          none_of(VectorValuesAndScales,
+      //                  [&](const std::tuple<Value *, unsigned, bool> &V) {
+      //                    return std::get<0>(V) == OpI;
+      //                  })) &&
+      //         isInstructionTriviallyDead(OpI, TLI))
+      //       DeadInsts.push_back(OpI);
+      // }
+
+      // VI->removeFromParent();
+      // Do it in a sandboxir way
+      SBI->removeFromParent();
+      eraseInstruction(VI);
+      SE->forgetValue(VI);
+    }
+  }
+
   /// Checks if the instruction was already analyzed for being possible
   /// reduction root.
   bool isAnalyzedReductionRoot(Instruction *I) const {
@@ -3557,6 +3731,8 @@ private:
   /// Vectorize a single entry in the tree, the \p Idx-th operand of the entry
   /// \p E.
   Value *vectorizeOperand(TreeEntry *E, unsigned NodeIdx);
+  // sandboxir version of vectorizeOperand
+  Value *SBvectorizeOperand(TreeEntry *E, unsigned NodeIdx, sandboxir::Context &Ctx);
 
   /// Create a new vector from a list of scalar values.  Produces a sequence
   /// which exploits values reused across lanes, and arranges the inserts
@@ -3570,7 +3746,10 @@ private:
   /// Create a new vector from a list of scalar values.  Produces a sequence
   /// which exploits values reused across lanes, and arranges the inserts
   /// for ease of later optimization.
-  Value *createBuildVector(const TreeEntry *E, Type *ScalarTy, sandboxir::Context &Ctx);
+  Value *createBuildVector(const TreeEntry *E, Type *ScalarTy);
+
+  // sandboxir version of createBuildVector
+  Value *SBcreateBuildVector(const TreeEntry *E, Type *ScalarTy, sandboxir::Context &Ctx);
 
   /// Returns the instruction in the bundle, which can be used as a base point
   /// for scheduling. Usually it is the last instruction in the bundle, except
@@ -3647,6 +3826,11 @@ private:
   /// specified, the starting vector value is poison.
   Value *
   gather(ArrayRef<Value *> VL, Value *Root, Type *ScalarTy,
+         function_ref<Value *(Value *, Value *, ArrayRef<int>)> CreateShuffle);
+
+  /// sandboxir version of gather
+  Value *
+  SBgather(ArrayRef<Value *> VL, Value *Root, Type *ScalarTy, sandboxir::Context &Ctx,
          function_ref<Value *(Value *, Value *, ArrayRef<int>)> CreateShuffle);
 
   /// \returns whether the VectorizableTree is fully vectorizable and will
@@ -5865,6 +6049,52 @@ static Value *createInsertVector(
   }
   return Vec;
 }
+/// sandboxir version of createInsertVector
+static Value *SBcreateInsertVector(
+    IRBuilderBase &Builder, Value *Vec, Value *V, unsigned Index, sandboxir::Context &Ctx,
+    function_ref<Value *(Value *, Value *, ArrayRef<int>)> Generator = {}) {
+  const unsigned SubVecVF = getNumElements(V->getType());
+  // sandboxir::InsertPosition SBIP = getSBInsertPosition(Builder, Ctx);
+  if (Index % SubVecVF == 0) {
+    Vec = Builder.CreateInsertVector(Vec->getType(), Vec, V,
+                                     Builder.getInt64(Index));
+    // llvm::CallInst *CI = llvm::dyn_cast<llvm::CallInst>(Vec);
+    // Ctx.createCallInst(CI);
+    Ctx.registerCreatedValue(Vec);
+  } else {
+    // Create shuffle, insertvector requires that index is multiple of
+    // the subvector length.
+    const unsigned VecVF = getNumElements(Vec->getType());
+    SmallVector<int> Mask(VecVF, PoisonMaskElem);
+    std::iota(Mask.begin(), Mask.end(), 0);
+    for (unsigned I : seq<unsigned>(SubVecVF))
+      Mask[I + Index] = I + VecVF;
+    if (Generator) {
+      Vec = Generator(Vec, V, Mask);
+    } else {
+      // 1. Resize V to the size of Vec.
+      SmallVector<int> ResizeMask(VecVF, PoisonMaskElem);
+      std::iota(ResizeMask.begin(), std::next(ResizeMask.begin(), SubVecVF), 0);
+      V = Builder.CreateShuffleVector(V, ResizeMask);
+      // if (auto *svi = dyn_cast<ShuffleVectorInst>(V)) 
+      //   Ctx.createShuffleVectorInst(svi);
+      // else if (auto *c = dyn_cast<Constant>(V)) 
+      //   Ctx.getOrCreateConstant(c);
+      // else 
+      //   llvm_unreachable("Unhandled V type!");
+      Ctx.registerCreatedValue(V);
+      Vec = Builder.CreateShuffleVector(Vec, V, Mask);
+      // if (auto *svi = dyn_cast<ShuffleVectorInst>(Vec)) 
+      //   Ctx.createShuffleVectorInst(svi);
+      // else if (auto *c = dyn_cast<Constant>(Vec)) 
+      //   Ctx.getOrCreateConstant(c);
+      // else 
+      //   llvm_unreachable("Unhandled Vec type!");
+      Ctx.registerCreatedValue(Vec);
+    }
+  }
+  return Vec;
+}
 
 /// Correctly creates extract_subvector, checking that the index is multiple of
 /// the subvectors length. Otherwise, generates shuffle using \p Generator or
@@ -5881,6 +6111,33 @@ static Value *createExtractVector(IRBuilderBase &Builder, Value *Vec,
   SmallVector<int> Mask(SubVecVF, PoisonMaskElem);
   std::iota(Mask.begin(), Mask.end(), Index);
   return Builder.CreateShuffleVector(Vec, Mask);
+}
+
+/// sandboxir version of createExtractVector
+static Value *SBcreateExtractVector(IRBuilderBase &Builder, Value *Vec,
+                                  unsigned SubVecVF, unsigned Index, sandboxir::Context &Ctx) {
+  if (Index % SubVecVF == 0) {
+    VectorType *SubVecTy =
+        getWidenedType(Vec->getType()->getScalarType(), SubVecVF);
+    Value *Ex = Builder.CreateExtractVector(SubVecTy, Vec, Builder.getInt64(Index));
+    // sandboxir::CallInst *CI = dyn_cast<CallInst>(Ex);
+    // Ctx.createCallInst(CI);
+    Ctx.registerCreatedValue(Ex);
+    return Ex;
+  }
+  // Create shuffle, extract_subvector requires that index is multiple of
+  // the subvector length.
+  SmallVector<int> Mask(SubVecVF, PoisonMaskElem);
+  std::iota(Mask.begin(), Mask.end(), Index);
+  Value *Shuffle = Builder.CreateShuffleVector(Vec, Mask);
+  // if (auto *svi = dyn_cast<ShuffleVectorInst>(Shuffle)) 
+  //   Ctx.createShuffleVectorInst(svi);
+  // else if (auto *c = dyn_cast<Constant>(Shuffle)) 
+  //   Ctx.getOrCreateConstant(c);
+  // else 
+  //   llvm_unreachable("Unhandled Vec type!");
+  Ctx.registerCreatedValue(Shuffle);
+  return Shuffle;
 }
 
 /// Builds compress-like mask for shuffles for the given \p PointerOps, ordered
@@ -16304,6 +16561,187 @@ Value *BoUpSLP::gather(
   return Vec;
 }
 
+Value *BoUpSLP::SBgather(
+    ArrayRef<Value *> VL, Value *Root, Type *ScalarTy, sandboxir::Context &Ctx,
+    function_ref<Value *(Value *, Value *, ArrayRef<int>)> CreateShuffle) {
+  // List of instructions/lanes from current block and/or the blocks which are
+  // part of the current loop. These instructions will be inserted at the end to
+  // make it possible to optimize loops and hoist invariant instructions out of
+  // the loops body with better chances for success.
+  SmallVector<std::pair<Value *, unsigned>, 4> PostponedInsts;
+  SmallSet<int, 4> PostponedIndices;
+  Loop *L = LI->getLoopFor(Builder.GetInsertBlock());
+  auto &&CheckPredecessor = [](BasicBlock *InstBB, BasicBlock *InsertBB) {
+    SmallPtrSet<BasicBlock *, 4> Visited;
+    while (InsertBB && InsertBB != InstBB && Visited.insert(InsertBB).second)
+      InsertBB = InsertBB->getSinglePredecessor();
+    return InsertBB && InsertBB == InstBB;
+  };
+  for (int I = 0, E = VL.size(); I < E; ++I) {
+    if (auto *Inst = dyn_cast<Instruction>(VL[I]))
+      if ((CheckPredecessor(Inst->getParent(), Builder.GetInsertBlock()) ||
+           isVectorized(Inst) ||
+           (L && (!Root || L->isLoopInvariant(Root)) && L->contains(Inst))) &&
+          PostponedIndices.insert(I).second)
+        PostponedInsts.emplace_back(Inst, I);
+  }
+
+  auto &&CreateInsertElement = [this, &Ctx](Value *Vec, Value *V, unsigned Pos,
+                                      Type *Ty) {
+    Value *Scalar = V;
+    if (Scalar->getType() != Ty) {
+      assert(Scalar->getType()->isIntOrIntVectorTy() &&
+             Ty->isIntOrIntVectorTy() && "Expected integer types only.");
+      Value *V = Scalar;
+      if (auto *CI = dyn_cast<CastInst>(Scalar);
+          isa_and_nonnull<SExtInst, ZExtInst>(CI)) {
+        Value *Op = CI->getOperand(0);
+        if (auto *IOp = dyn_cast<Instruction>(Op);
+            !IOp || !(isDeleted(IOp) || isVectorized(IOp)))
+          V = Op;
+      }
+      // sandboxir::InsertPosition SBIP = getSBInsertPosition(Builder, Ctx);
+      // sandboxir::Instruction::Opcode castop = 
+      //  V->getType()->getScalarSizeInBits() > Ty->getScalarSizeInBits() ?
+      //         sandboxir::Instruction::Opcode::Trunc :
+      //         (!isKnownNonNegative(Scalar, SimplifyQuery(*DL)) ? 
+      //         sandboxir::Instruction::Opcode::SExt : sandboxir::Instruction::Opcode::ZExt);
+      // if (V->getType() != Ty) {
+      //   sandboxir::Value* sbcast_V = sandboxir::CastInst::create(Ty, castop, V, SBIP, Ctx);
+      //   llvm::Instruction* llvm_sbcast_V = dyn_cast<llvm::Instruction>(sbcast_V->getLLVMValue());
+      //   if (llvm_sbcast_V) {
+      //     if (isa<FPMathOperator>(llvm_sbcast_V)) {
+      //       llvm_sbcast_V->setFastMathFlags(Builder.getFastMathFlags());
+      //     }
+      //     Builder.AddMetadataToInst(llvm_sbcast_V);
+      //   }
+      //   Scalar = llvm_sbcast_V;
+      // }
+      Scalar = Builder.CreateIntCast(
+          V, Ty, !isKnownNonNegative(Scalar, SimplifyQuery(*DL)));
+      // if (auto *sic = dyn_cast<CastInst>(Scalar)) 
+      //   Ctx.createCastInst(sic);
+      // else if (auto *c = dyn_cast<Constant>(Scalar)) 
+      //   Ctx.getOrCreateConstant(c);
+      Ctx.registerCreatedValue(Scalar);
+      // the createcast() may not insert, so we don't consider other condition for now.
+    }
+
+    Instruction *InsElt;
+    if (auto *VecTy = dyn_cast<FixedVectorType>(Scalar->getType())) {
+      assert(SLPReVec && "FixedVectorType is not expected.");
+      Vec =
+          SBcreateInsertVector(Builder, Vec, Scalar, Pos * getNumElements(VecTy), Ctx);
+
+      // Vec =
+      //     createInsertVector(Builder, Vec, Scalar, Pos * getNumElements(VecTy));
+      auto *II = dyn_cast<IntrinsicInst>(Vec);
+      if (!II || II->getIntrinsicID() != Intrinsic::vector_insert)
+        return Vec;
+      InsElt = II;
+    } else {
+      Vec = Builder.CreateInsertElement(Vec, Scalar, Builder.getInt32(Pos));
+      // if (auto *svi = dyn_cast<InsertElementInst>(Vec)) 
+      //   Ctx.createInsertElementInst(svi);
+      // else if (auto *c = dyn_cast<Constant>(Vec)) 
+      //   Ctx.getOrCreateConstant(c);
+      // else 
+      //   llvm_unreachable("Unhandled V type!");
+      Ctx.registerCreatedValue(Vec);
+      InsElt = dyn_cast<InsertElementInst>(Vec);
+      if (!InsElt)
+        return Vec;
+    }
+    GatherShuffleExtractSeq.insert(InsElt);
+    CSEBlocks.insert(InsElt->getParent());
+    // Add to our 'need-to-extract' list.
+    if (isa<Instruction>(V)) {
+      if (ArrayRef<TreeEntry *> Entries = getTreeEntries(V); !Entries.empty()) {
+        // Find which lane we need to extract.
+        User *UserOp = nullptr;
+        if (Scalar != V) {
+          if (auto *SI = dyn_cast<Instruction>(Scalar))
+            UserOp = SI;
+        } else {
+          UserOp = InsElt;
+        }
+        if (UserOp) {
+          unsigned FoundLane = Entries.front()->findLaneForValue(V);
+          ExternalUses.emplace_back(V, UserOp, *Entries.front(), FoundLane);
+        }
+      }
+    }
+    return Vec;
+  };
+  auto *VecTy = getWidenedType(ScalarTy, VL.size());
+  Value *Vec = PoisonValue::get(VecTy);
+  SmallVector<int> NonConsts;
+  SmallVector<int> Mask(VL.size());
+  std::iota(Mask.begin(), Mask.end(), 0);
+  Value *OriginalRoot = Root;
+  if (auto *SV = dyn_cast_or_null<ShuffleVectorInst>(Root);
+      SV && isa<PoisonValue>(SV->getOperand(1)) &&
+      SV->getOperand(0)->getType() == VecTy) {
+    Root = SV->getOperand(0);
+    Mask.assign(SV->getShuffleMask().begin(), SV->getShuffleMask().end());
+  }
+  // Insert constant values at first.
+  for (int I = 0, E = VL.size(); I < E; ++I) {
+    if (PostponedIndices.contains(I))
+      continue;
+    if (!isConstant(VL[I])) {
+      NonConsts.push_back(I);
+      continue;
+    }
+    if (isa<PoisonValue>(VL[I]))
+      continue;
+    Vec = CreateInsertElement(Vec, VL[I], I, ScalarTy);
+    Mask[I] = I + E;
+  }
+  if (Root) {
+    if (isa<PoisonValue>(Vec)) {
+      Vec = OriginalRoot;
+    } else {
+      Vec = CreateShuffle(Root, Vec, Mask);
+      if (auto *OI = dyn_cast<Instruction>(OriginalRoot);
+          OI && OI->use_empty() &&
+          none_of(VectorizableTree, [&](const std::unique_ptr<TreeEntry> &TE) {
+            return TE->VectorizedValue == OI;
+          })) {
+            // if (sandboxir::Instruction *SBEI = dyn_cast<sandboxir::Instruction>(Ctx.getValue(OI))) 
+            //   SBEI->eraseFromParent();
+            eraseInstruction(OI);        
+          }
+        
+    }
+  }
+  // Insert non-constant values.
+  for (int I : NonConsts) {
+    Vec = CreateInsertElement(Vec, VL[I], I, ScalarTy);
+    // if (auto *svi = dyn_cast<InsertElementInst>(Vec)) 
+    //   Ctx.createInsertElementInst(svi);
+    // else if (auto *c = dyn_cast<Constant>(Vec)) 
+    //   Ctx.getOrCreateConstant(c);
+    // else 
+    //   llvm_unreachable("Unhandled Vec type!");
+    Ctx.registerCreatedValue(Vec);
+  }
+    
+  // Append instructions, which are/may be part of the loop, in the end to make
+  // it possible to hoist non-loop-based instructions.
+  for (const std::pair<Value *, unsigned> &Pair : PostponedInsts) {
+    Vec = CreateInsertElement(Vec, Pair.first, Pair.second, ScalarTy);
+    // if (auto *svi = dyn_cast<InsertElementInst>(Vec)) 
+    //   Ctx.createInsertElementInst(svi);
+    // else if (auto *c = dyn_cast<Constant>(Vec)) 
+    //   Ctx.getOrCreateConstant(c);
+    // else 
+    //   llvm_unreachable("Unhandled Vec type!");
+    Ctx.registerCreatedValue(Vec);
+  }
+  return Vec;
+}
+
 /// Merges shuffle masks and emits final shuffle instruction, if required. It
 /// supports shuffling of 2 input vectors. It implements lazy shuffles emission,
 /// when the actual shuffle instruction is generated only if this is actually
@@ -16907,42 +17345,90 @@ class BoUpSLP::SBShuffleInstructionBuilder final : public BaseShuffleAnalysis {
           CSEBlocks(CSEBlocks), DL(DL) {}
     ~ShuffleIRBuilder() = default;
 
-    sandboxir::InsertPosition getSBIP() {
-      return getSBInsertPosition(Builder, Ctx);
-    }
+    // sandboxir::InsertPosition getSBIP() {
+    //   return getSBInsertPosition(Builder, Ctx);
+    // }
 
     /// Creates shufflevector for the 2 operands with the given mask.
     // use sandbox ir to create shuffle vector instruction then return the corresponding llvm instruction
+    // Value *createShuffleVector(Value *V1, Value *V2, ArrayRef<int> Mask) {
+    //   sandboxir::InsertPosition SBIP = getSBIP();
+    //   sandboxir::Value *SBV1 = Ctx.getValue(V1);
+    //   sandboxir::Value *SBV2 = Ctx.getValue(V2);
+    //   sandboxir::Type *SBV1Ty = SBV1->getType();
+    //   sandboxir::Type *SBV2Ty = SBV2->getType();
+    //   if (V1->getType() != V2->getType()) {
+    //     assert(V1->getType()->isIntOrIntVectorTy() &&
+    //            V1->getType()->isIntOrIntVectorTy() &&
+    //            "Expected integer vector types only.");
+    //     if (V1->getType() != V2->getType()) {
+    //       if (cast<VectorType>(V2->getType())
+    //               ->getElementType()
+    //               ->getIntegerBitWidth() < cast<VectorType>(V1->getType())
+    //                                            ->getElementType()
+    //                                            ->getIntegerBitWidth()) {
+    //         // Do createintcast in sandboxir
+    //         // Fix it: we haven't consider const folding for now in sbir
+    //         bool IsSigned = !isKnownNonNegative(V2, SimplifyQuery(DL));
+    //         sandboxir::Instruction::Opcode castOp = 
+    //           V2->getType()->getScalarSizeInBits() > V1->getType()->getScalarSizeInBits() ?
+    //           sandboxir::Instruction::Opcode::Trunc :
+    //           (IsSigned ? sandboxir::Instruction::Opcode::SExt : sandboxir::Instruction::Opcode::ZExt);
+    //         if (V2->getType() != SBV1Ty) { // see createcast() in IRBuilder.h
+    //           sandboxir::Value* sbcast_V2 = sandboxir::CastInst::create(SBV1Ty, castOp, SBV2, SBIP, Ctx);
+    //           llvm::Instruction* llvm_sbcast_V2 = dyn_cast<llvm::Instruction>(sbcast_V2->getLLVMValue());
+    //           if (llvm_sbcast_V2) {
+    //             if (isa<FPMathOperator>(llvm_sbcast_V2)) {
+    //               llvm_sbcast_V2->setFastMathFlags(Builder.getFastMathFlags());
+    //             }
+    //             Builder.AddMetadataToInst(llvm_sbcast_V2);
+    //           }
+    //           V2 = llvm_sbcast_V2;
+    //         }
+    //       } else {
+    //         // Do createintcast in sandboxir
+    //         bool IsSigned = !isKnownNonNegative(V1, SimplifyQuery(DL));
+    //         sandboxir::Instruction::Opcode castOp = 
+    //           V1->getType()->getScalarSizeInBits() > V2->getType()->getScalarSizeInBits() ?
+    //           sandboxir::Instruction::Opcode::Trunc :
+    //           (IsSigned ? sandboxir::Instruction::Opcode::SExt : sandboxir::Instruction::Opcode::ZExt);
+    //         if (V1->getType() != SBV2Ty) { // see createcast() in IRBuilder.h
+    //           sandboxir::Value* sbcast_V1 = sandboxir::CastInst::create(SBV2Ty, castOp, SBV1, SBIP, Ctx);
+    //           llvm::Instruction* llvm_sbcast_V1 = dyn_cast<llvm::Instruction>(sbcast_V1->getLLVMValue());
+    //           if (llvm_sbcast_V1) {
+    //             if (isa<FPMathOperator>(llvm_sbcast_V1)) {
+    //               llvm_sbcast_V1->setFastMathFlags(Builder.getFastMathFlags());
+    //             }
+    //             Builder.AddMetadataToInst(llvm_sbcast_V1);
+    //           }
+    //           V1 = llvm_sbcast_V1;
+    //         }
+    //       }
+    //         // V2 = Builder.CreateIntCast(
+    //         //     V2, V1->getType(), !isKnownNonNegative(V2, SimplifyQuery(DL)));
+    //       // else
+    //       //   V1 = Builder.CreateIntCast(
+    //       //       V1, V2->getType(), !isKnownNonNegative(V1, SimplifyQuery(DL)));
+    //     }
+    //   }
+    //   SBIP = getSBIP();
+    //   sandboxir::Value *SBShuffle = sandboxir::ShuffleVectorInst::create(SBV1, SBV2, Mask, SBIP, Ctx);
+    //   llvm::Instruction *llvm_sbshuffle = dyn_cast<llvm::Instruction>(SBShuffle->getLLVMValue());
+    //   if (llvm_sbshuffle) {
+    //     GatherShuffleExtractSeq.insert(llvm_sbshuffle);
+    //     CSEBlocks.insert(llvm_sbshuffle->getParent());
+    //   }
+    //   return llvm_sbshuffle;
+
+    //   // Value *Vec = Builder.CreateShuffleVector(V1, V2, Mask);
+    //   // if (auto *I = dyn_cast<Instruction>(Vec)) {
+    //   //   GatherShuffleExtractSeq.insert(I);
+    //   //   CSEBlocks.insert(I->getParent());
+    //   // }
+    //   // return Vec;
+    // }
+
     Value *createShuffleVector(Value *V1, Value *V2, ArrayRef<int> Mask) {
-      // first set the insert point for sandboxir
-      // llvm::BasicBlock *LlvmBB = Builder.GetInsertBlock();
-      // llvm::BasicBlock::iterator LlvmIt = Builder.GetInsertPoint();
-
-      // sandboxir::BasicBlock *SbBB = dyn_cast_or_null<sandboxir::BasicBlock>(Ctx.getValue(LlvmBB));
-      // assert(SbBB && "Current BasicBlock not in SandboxIR Context");
-
-      // sandboxir::BBIterator SbBIt;
-      // if (LlvmIt == LlvmBB->end()) {
-      //     SbBIt = SbBB->end();
-      // } else {
-      //     sandboxir::Instruction *SbBeforeInst = dyn_cast_or_null<sandboxir::Instruction>(Ctx.getValue(&*LlvmIt));
-      //     assert(SbBeforeInst && "Instruction at LLVM insert point not in SandboxIR context");
-      //     SbBIt = SbBeforeInst->getIterator();
-      // }
-      // sandboxir::InsertPosition SBInsertPos(SbBIt);
-      // end of setting the insert point
-      // get sandboxir value and type
-      // sandboxir::Value *SBV1 = Ctx.getValue(V1);
-      // sandboxir::Value *SBV2 = Ctx.getValue(V2);
-      // sandboxir::Type *SBV1Ty = SBV1->getType();
-      // sandboxir::Type *SBV2Ty = SBV2->getType();
-      
-      // end of getting sandboxir value and type
-      sandboxir::InsertPosition SBIP = getSBIP();
-      sandboxir::Value *SBV1 = Ctx.getValue(V1);
-      sandboxir::Value *SBV2 = Ctx.getValue(V2);
-      sandboxir::Type *SBV1Ty = SBV1->getType();
-      sandboxir::Type *SBV2Ty = SBV2->getType();
       if (V1->getType() != V2->getType()) {
         assert(V1->getType()->isIntOrIntVectorTy() &&
                V1->getType()->isIntOrIntVectorTy() &&
@@ -16953,65 +17439,69 @@ class BoUpSLP::SBShuffleInstructionBuilder final : public BaseShuffleAnalysis {
                   ->getIntegerBitWidth() < cast<VectorType>(V1->getType())
                                                ->getElementType()
                                                ->getIntegerBitWidth()) {
-            // Do createintcast in sandboxir
-            // Fix it: we haven't consider const folding for now in sbir
-            bool IsSigned = !isKnownNonNegative(V2, SimplifyQuery(DL));
-            sandboxir::Instruction::Opcode castOp = 
-              V2->getType()->getScalarSizeInBits() > V1->getType()->getScalarSizeInBits() ?
-              sandboxir::Instruction::Opcode::Trunc :
-              (IsSigned ? sandboxir::Instruction::Opcode::SExt : sandboxir::Instruction::Opcode::ZExt);
-            sandboxir::Value* sbcast_V2 = sandboxir::CastInst::create(SBV1Ty, castOp, SBV2, SBIP, Ctx);
-            llvm::Instruction* llvm_sbcast_V2 = dyn_cast<llvm::Instruction>(sbcast_V2->getLLVMValue());
-            if (llvm_sbcast_V2) {
-              if (isa<FPMathOperator>(llvm_sbcast_V2)) {
-                llvm_sbcast_V2->setFastMathFlags(Builder.getFastMathFlags());
-              }
-              Builder.AddMetadataToInst(llvm_sbcast_V2);
-            }
-            V2 = llvm_sbcast_V2;
+            V2 = Builder.CreateIntCast(
+                V2, V1->getType(), !isKnownNonNegative(V2, SimplifyQuery(DL)));
+            // for sandbox ir
+            // if (auto *sic = dyn_cast<CastInst>(V2)) 
+            //   Ctx.createCastInst(sic);
+            // else if (auto *c = dyn_cast<Constant>(V2)) 
+            //   Ctx.getOrCreateConstant(c);
+            Ctx.registerCreatedValue(V2);
           } else {
-            // Do createintcast in sandboxir
-            bool IsSigned = !isKnownNonNegative(V1, SimplifyQuery(DL));
-            sandboxir::Instruction::Opcode castOp = 
-              V1->getType()->getScalarSizeInBits() > V2->getType()->getScalarSizeInBits() ?
-              sandboxir::Instruction::Opcode::Trunc :
-              (IsSigned ? sandboxir::Instruction::Opcode::SExt : sandboxir::Instruction::Opcode::ZExt);
-            sandboxir::Value* sbcast_V1 = sandboxir::CastInst::create(SBV2Ty, castOp, SBV1, SBIP, Ctx);
-            llvm::Instruction* llvm_sbcast_V1 = dyn_cast<llvm::Instruction>(sbcast_V1->getLLVMValue());
-            if (llvm_sbcast_V1) {
-              if (isa<FPMathOperator>(llvm_sbcast_V1)) {
-                llvm_sbcast_V1->setFastMathFlags(Builder.getFastMathFlags());
-              }
-              Builder.AddMetadataToInst(llvm_sbcast_V1);
-            }
-            V1 = llvm_sbcast_V1;
+            V1 = Builder.CreateIntCast(
+                V1, V2->getType(), !isKnownNonNegative(V1, SimplifyQuery(DL)));
+            // for sandbox ir
+            // if (auto *sic = dyn_cast<CastInst>(V1)) 
+            //   Ctx.createCastInst(sic);
+            // else if (auto *c = dyn_cast<Constant>(V1)) 
+            //   Ctx.getOrCreateConstant(c);
+            Ctx.registerCreatedValue(V1);
           }
-            // V2 = Builder.CreateIntCast(
-            //     V2, V1->getType(), !isKnownNonNegative(V2, SimplifyQuery(DL)));
-          // else
-          //   V1 = Builder.CreateIntCast(
-          //       V1, V2->getType(), !isKnownNonNegative(V1, SimplifyQuery(DL)));
         }
       }
-      SBIP = getSBIP();
-      sandboxir::Value *SBShuffle = sandboxir::ShuffleVectorInst::create(SBV1, SBV2, Mask, SBIP, Ctx);
-      llvm::Instruction *llvm_sbshuffle = dyn_cast<llvm::Instruction>(SBShuffle->getLLVMValue());
-      if (llvm_sbshuffle) {
-        GatherShuffleExtractSeq.insert(llvm_sbshuffle);
-        CSEBlocks.insert(llvm_sbshuffle->getParent());
+      Value *Vec = Builder.CreateShuffleVector(V1, V2, Mask);
+      // for sandboxir
+      // if (auto *svi = dyn_cast<ShuffleVectorInst>(Vec)) 
+      //   Ctx.createShuffleVectorInst(svi);
+      // else if (auto *c = dyn_cast<Constant>(Vec)) 
+      //   Ctx.getOrCreateConstant(c);
+      // else 
+      //   llvm_unreachable("Expected ShuffleVectorInst or Constant");
+      Ctx.registerCreatedValue(Vec);
+      if (auto *I = dyn_cast<Instruction>(Vec)) {
+        GatherShuffleExtractSeq.insert(I);
+        CSEBlocks.insert(I->getParent());
       }
-      return llvm_sbshuffle;
-
-      // Value *Vec = Builder.CreateShuffleVector(V1, V2, Mask);
-      // if (auto *I = dyn_cast<Instruction>(Vec)) {
-      //   GatherShuffleExtractSeq.insert(I);
-      //   CSEBlocks.insert(I->getParent());
-      // }
-      // return Vec;
+      return Vec;
     }
+
     /// Creates permutation of the single vector operand with the given mask, if
     /// it is not identity mask.
     // use sandbox ir to create shuffle vector instruction then return the corresponding llvm instruction
+    // Value *createShuffleVector(Value *V1, ArrayRef<int> Mask) {
+    //   if (Mask.empty())
+    //     return V1;
+    //   unsigned VF = Mask.size();
+    //   unsigned LocalVF = cast<FixedVectorType>(V1->getType())->getNumElements();
+    //   if (VF == LocalVF && ShuffleVectorInst::isIdentityMask(Mask, VF))
+    //     return V1;
+    //   sandboxir::InsertPosition SBIP = getSBIP();
+    //   sandboxir::Value *sbV1 = Ctx.getValue(V1);
+    //   sandboxir::Value *sbV2_poison = sandboxir::PoisonValue::get(sbV1->getType());
+    //   sandboxir::Value *SBShuffle = sandboxir::ShuffleVectorInst::create(sbV1, sbV2_poison, Mask, SBIP, Ctx);
+    //   llvm::Instruction *llvm_sbshuffle = dyn_cast<llvm::Instruction>(SBShuffle->getLLVMValue());
+    //   if (llvm_sbshuffle) {
+    //     GatherShuffleExtractSeq.insert(llvm_sbshuffle);
+    //     CSEBlocks.insert(llvm_sbshuffle->getParent());
+    //   }
+    //   return llvm_sbshuffle;
+    //   // Value *Vec = Builder.CreateShuffleVector(V1, Mask);
+    //   // if (auto *I = dyn_cast<Instruction>(Vec)) {
+    //   //   GatherShuffleExtractSeq.insert(I);
+    //   //   CSEBlocks.insert(I->getParent());
+    //   // }
+    //   // return Vec;
+    // }
     Value *createShuffleVector(Value *V1, ArrayRef<int> Mask) {
       if (Mask.empty())
         return V1;
@@ -17019,26 +17509,31 @@ class BoUpSLP::SBShuffleInstructionBuilder final : public BaseShuffleAnalysis {
       unsigned LocalVF = cast<FixedVectorType>(V1->getType())->getNumElements();
       if (VF == LocalVF && ShuffleVectorInst::isIdentityMask(Mask, VF))
         return V1;
-      sandboxir::InsertPosition SBIP = getSBIP();
-      sandboxir::Value *sbV1 = Ctx.getValue(V1);
-      sandboxir::Value *sbV2_poison = sandboxir::PoisonValue::get(sbV1->getType());
-      sandboxir::Value *SBShuffle = sandboxir::ShuffleVectorInst::create(sbV1, sbV2_poison, Mask, SBIP, Ctx);
-      llvm::Instruction *llvm_sbshuffle = dyn_cast<llvm::Instruction>(SBShuffle->getLLVMValue());
-      if (llvm_sbshuffle) {
-        GatherShuffleExtractSeq.insert(llvm_sbshuffle);
-        CSEBlocks.insert(llvm_sbshuffle->getParent());
+      Value *Vec = Builder.CreateShuffleVector(V1, Mask);
+      // for sandboxir
+      // if (auto *svi = dyn_cast<ShuffleVectorInst>(Vec)) 
+      //   Ctx.createShuffleVectorInst(svi);
+      // else if (auto *c = dyn_cast<Constant>(Vec)) 
+      //   Ctx.getOrCreateConstant(c);
+      // else 
+      //   llvm_unreachable("Expected ShuffleVectorInst or Constant");
+      Ctx.registerCreatedValue(Vec);
+      if (auto *I = dyn_cast<Instruction>(Vec)) {
+        GatherShuffleExtractSeq.insert(I);
+        CSEBlocks.insert(I->getParent());
       }
-      return llvm_sbshuffle;
-      // Value *Vec = Builder.CreateShuffleVector(V1, Mask);
-      // if (auto *I = dyn_cast<Instruction>(Vec)) {
-      //   GatherShuffleExtractSeq.insert(I);
-      //   CSEBlocks.insert(I->getParent());
-      // }
-      // return Vec;
+      return Vec;
     }
+
     Value *createIdentity(Value *V) { return V; }
     Value *createPoison(Type *Ty, unsigned VF) {
-      return PoisonValue::get(getWidenedType(Ty, VF));
+      // return PoisonValue::get(getWidenedType(Ty, VF));
+      Type *LLVMWidenedTy = getWidenedType(Ty, VF);
+      sandboxir::Type *SBWidenedTy = Ctx.getType(LLVMWidenedTy);
+      assert(SBWidenedTy && "Failed to get SandboxIR type for LLVM type");
+      sandboxir::Value *SBPoison = sandboxir::PoisonValue::get(SBWidenedTy);
+      llvm::Value *llvm_sbpoison = SBPoison->getLLVMValue();
+      return llvm_sbpoison;
     }
     /// Resizes 2 input vector to match the sizes, if the they are not equal
     /// yet. The smallest vector is resized to the size of the larger vector.
@@ -17053,26 +17548,55 @@ class BoUpSLP::SBShuffleInstructionBuilder final : public BaseShuffleAnalysis {
       std::iota(IdentityMask.begin(), std::next(IdentityMask.begin(), MinVF),
                 0);
       Value *&Op = MinVF == V1VF ? V1 : V2;
-      sandboxir::InsertPosition SBIP = getSBIP();
-      sandboxir::Value *sbOp = Ctx.getValue(Op);
-      sandboxir::Value *sbOp_poison = sandboxir::PoisonValue::get(sbOp->getType());
-      sandboxir::Value *SBShuffle = sandboxir::ShuffleVectorInst::create(sbOp, sbOp_poison, IdentityMask, SBIP, Ctx);
-      llvm::Instruction *llvm_sbshuffle = dyn_cast<llvm::Instruction>(SBShuffle->getLLVMValue());
-      if (llvm_sbshuffle) {
-        GatherShuffleExtractSeq.insert(llvm_sbshuffle);
-        CSEBlocks.insert(llvm_sbshuffle->getParent());
+      Op = Builder.CreateShuffleVector(Op, IdentityMask);
+      // for sandboxir
+      // if (auto *svi = dyn_cast<ShuffleVectorInst>(Op)) 
+      //   Ctx.createShuffleVectorInst(svi);
+      // else if (auto *c = dyn_cast<Constant>(Op)) 
+      //   Ctx.getOrCreateConstant(c);
+      // else 
+      //   llvm_unreachable("Expected ShuffleVectorInst or Constant");
+      Ctx.registerCreatedValue(Op);
+      if (auto *I = dyn_cast<Instruction>(Op)) {
+        GatherShuffleExtractSeq.insert(I);
+        CSEBlocks.insert(I->getParent());
       }
-      Op = llvm_sbshuffle;
-      // Op = Builder.CreateShuffleVector(Op, IdentityMask);
-      // if (auto *I = dyn_cast<Instruction>(Op)) {
-      //   GatherShuffleExtractSeq.insert(I);
-      //   CSEBlocks.insert(I->getParent());
-      // }
       if (MinVF == V1VF)
         V1 = Op;
       else
         V2 = Op;
     }
+    // void resizeToMatch(Value *&V1, Value *&V2) {
+    //   if (V1->getType() == V2->getType())
+    //     return;
+    //   int V1VF = cast<FixedVectorType>(V1->getType())->getNumElements();
+    //   int V2VF = cast<FixedVectorType>(V2->getType())->getNumElements();
+    //   int VF = std::max(V1VF, V2VF);
+    //   int MinVF = std::min(V1VF, V2VF);
+    //   SmallVector<int> IdentityMask(VF, PoisonMaskElem);
+    //   std::iota(IdentityMask.begin(), std::next(IdentityMask.begin(), MinVF),
+    //             0);
+    //   Value *&Op = MinVF == V1VF ? V1 : V2;
+    //   sandboxir::InsertPosition SBIP = getSBIP();
+    //   sandboxir::Value *sbOp = Ctx.getValue(Op);
+    //   sandboxir::Value *sbOp_poison = sandboxir::PoisonValue::get(sbOp->getType());
+    //   sandboxir::Value *SBShuffle = sandboxir::ShuffleVectorInst::create(sbOp, sbOp_poison, IdentityMask, SBIP, Ctx);
+    //   llvm::Instruction *llvm_sbshuffle = dyn_cast<llvm::Instruction>(SBShuffle->getLLVMValue());
+    //   if (llvm_sbshuffle) {
+    //     GatherShuffleExtractSeq.insert(llvm_sbshuffle);
+    //     CSEBlocks.insert(llvm_sbshuffle->getParent());
+    //   }
+    //   Op = llvm_sbshuffle;
+    //   // Op = Builder.CreateShuffleVector(Op, IdentityMask);
+    //   // if (auto *I = dyn_cast<Instruction>(Op)) {
+    //   //   GatherShuffleExtractSeq.insert(I);
+    //   //   CSEBlocks.insert(I->getParent());
+    //   // }
+    //   if (MinVF == V1VF)
+    //     V1 = Op;
+    //   else
+    //     V2 = Op;
+    // }
   };
 
   /// Smart shuffle instruction emission, walks through shuffles trees and
@@ -17080,7 +17604,7 @@ class BoUpSLP::SBShuffleInstructionBuilder final : public BaseShuffleAnalysis {
   /// instruction.
   Value *createShuffle(Value *V1, Value *V2, ArrayRef<int> Mask) {
     assert(V1 && "Expected at least one vector value.");
-    ShuffleIRBuilder ShuffleBuilder(Builder, R.GatherShuffleExtractSeq,
+    ShuffleIRBuilder ShuffleBuilder(Builder, Ctx, R.GatherShuffleExtractSeq,
                                     R.CSEBlocks, *R.DL);
     return BaseShuffleAnalysis::createShuffle<Value *>(
         V1, V2, Mask, ShuffleBuilder, ScalarTy);
@@ -17094,13 +17618,53 @@ class BoUpSLP::SBShuffleInstructionBuilder final : public BaseShuffleAnalysis {
     assert(getNumElements(VecTy) % getNumElements(ScalarTy) == 0);
     if (VecTy->getElementType() == ScalarTy->getScalarType())
       return V;
-    return Builder.CreateIntCast(
+    // for sandboxir
+    llvm::Value *llvm_cast = Builder.CreateIntCast(
         V, VectorType::get(ScalarTy->getScalarType(), VecTy->getElementCount()),
         IsSigned.value_or(!isKnownNonNegative(V, SimplifyQuery(*R.DL))));
+    // for sandboxir
+    // if (auto *sic = dyn_cast<CastInst>(llvm_cast)) 
+    //   Ctx.createCastInst(sic);
+    // else if (auto *c = dyn_cast<Constant>(llvm_cast)) 
+    //   Ctx.getOrCreateConstant(c);
+    Ctx.registerCreatedValue(llvm_cast);
+    return llvm_cast;
+    // return Builder.CreateIntCast(
+    //     V, VectorType::get(ScalarTy->getScalarType(), VecTy->getElementCount()),
+    //     IsSigned.value_or(!isKnownNonNegative(V, SimplifyQuery(*R.DL))));
   }
+  // Value *castToScalarTyElem(Value *V,
+  //                           std::optional<bool> IsSigned = std::nullopt) {
+  //   auto *VecTy = cast<VectorType>(V->getType());
+  //   assert(getNumElements(VecTy) % getNumElements(ScalarTy) == 0);
+  //   if (VecTy->getElementType() == ScalarTy->getScalarType())
+  //     return V;
+  //   sandboxir::Instruction::Opcode castOp = 
+  //             V->getType()->getScalarSizeInBits() > 
+  //             VectorType::get(ScalarTy->getScalarType(), VecTy->getElementCount())->getScalarSizeInBits() ?
+  //             sandboxir::Instruction::Opcode::Trunc :
+  //             (IsSigned.value_or(!isKnownNonNegative(V, SimplifyQuery(*R.DL))) ? 
+  //             sandboxir::Instruction::Opcode::SExt : sandboxir::Instruction::Opcode::ZExt);
+  //   if (V->getType() == VectorType::get(ScalarTy->getScalarType(), VecTy->getElementCount())) return V;
+  //   sandboxir::InsertPosition SBIP = getSBIP();
+  //   sandboxir::Value *SBV = Ctx.getValue(V);
+  //   sandboxir::Value *SBV_cast = sandboxir::CastInst::create(SBV->getType(), castOp, SBV, SBIP, Ctx);
+  //   llvm::Instruction *llvm_sbcast = dyn_cast<llvm::Instruction>(SBV_cast->getLLVMValue());
+  //   if (llvm_sbcast) {
+  //     if (isa<FPMathOperator>(llvm_sbcast)) {
+  //       llvm_sbcast->setFastMathFlags(Builder.getFastMathFlags());
+  //     }
+  //     Builder.AddMetadataToInst(llvm_sbcast);
+  //   }
+  //   return llvm_sbcast;
+
+  //   // return Builder.CreateIntCast(
+  //   //     V, VectorType::get(ScalarTy->getScalarType(), VecTy->getElementCount()),
+  //   //     IsSigned.value_or(!isKnownNonNegative(V, SimplifyQuery(*R.DL))));
+  // }
 
 public:
-  SBShuffleInstructionBuilder(Type *ScalarTy, IRBuilderBase &Builder, BoUpSLP &R, sandboxir::Context &Ctx)
+  SBShuffleInstructionBuilder(Type *ScalarTy, sandboxir::Context &Ctx, IRBuilderBase &Builder, BoUpSLP &R)
       : BaseShuffleAnalysis(ScalarTy), Builder(Builder), R(R), Ctx(Ctx) {}
 
   /// Adjusts extractelements after reusing them.
@@ -17144,6 +17708,9 @@ public:
                              }) != 1);
           }))
         continue;
+      // if (sandboxir::Instruction *SBEI = dyn_cast<sandboxir::Instruction>(Ctx.getValue(EI))) {
+      //   SBEI->eraseFromParent();        
+      // }
       R.eraseInstruction(EI);
     }
     if (NumParts == 1 || UniqueBases.size() == 1) {
@@ -17251,11 +17818,38 @@ public:
     // Postpone gather emission, will be emitted after the end of the
     // process to keep correct order.
     auto *ResVecTy = getWidenedType(ScalarTy, E->getVectorFactor());
-    return Builder.CreateAlignedLoad(
-        ResVecTy,
-        PoisonValue::get(PointerType::getUnqual(ScalarTy->getContext())),
-        MaybeAlign());
+    llvm::Value *llvm_load = Builder.CreateAlignedLoad(
+              ResVecTy,
+              PoisonValue::get(PointerType::getUnqual(ScalarTy->getContext())),
+              MaybeAlign());
+    // for sandboxir
+    // Ctx.createLoadInst(dyn_cast<LoadInst>(llvm_load));
+    Ctx.registerCreatedValue(llvm_load);
+    return llvm_load;
   }
+  // std::optional<Value *>
+  // needToDelay(const TreeEntry *E,
+  //             ArrayRef<SmallVector<const TreeEntry *>> Deps) const {
+  //   // No need to delay emission if all deps are ready.
+  //   if (all_of(Deps, [](ArrayRef<const TreeEntry *> TEs) {
+  //         return all_of(
+  //             TEs, [](const TreeEntry *TE) { return TE->VectorizedValue; });
+  //       }))
+  //     return std::nullopt;
+  //   // Postpone gather emission, will be emitted after the end of the
+  //   // process to keep correct order.
+  //   auto *ResVecTy = getWidenedType(ScalarTy, E->getVectorFactor());
+  //   sandboxir::InsertPosition SBIP = getSBIP();
+  //   sandboxir::Type *SBResVecTy = Ctx.getType(ResVecTy);
+  //   sandboxir::PointerType *SBpoisonTy = sandboxir::PointerType::get(Ctx, 0);
+  //   sandboxir::Value *SBpoison = sandboxir::PoisonValue::get(SBpoisonTy);
+  //   sandboxir::LoadInst *SBLoad = sandboxir::LoadInst::create(SBResVecTy, SBpoison, MaybeAlign(), SBIP, false, Ctx);
+  //   // return Builder.CreateAlignedLoad(
+  //   //     ResVecTy,
+  //   //     PoisonValue::get(PointerType::getUnqual(ScalarTy->getContext())),
+  //   //     MaybeAlign());
+  //   return SBLoad->getLLVMValue();
+  // }
   /// Reset the builder to handle perfect diamond match.
   void resetForSameNode() {
     IsFinalized = false;
@@ -17391,12 +17985,18 @@ public:
   }
   Value *gather(ArrayRef<Value *> VL, unsigned MaskVF = 0,
                 Value *Root = nullptr) {
-    return R.gather(VL, Root, ScalarTy,
+    return R.SBgather(VL, Root, ScalarTy, Ctx,
                     [&](Value *V1, Value *V2, ArrayRef<int> Mask) {
                       return createShuffle(V1, V2, Mask);
                     });
   }
-  Value *createFreeze(Value *V) { return Builder.CreateFreeze(V); }
+  Value *createFreeze(Value *V) { 
+    Value* freeze = Builder.CreateFreeze(V);
+    // if (auto *fi = dyn_cast<FreezeInst>(freeze)) 
+    //   Ctx.createFreezeInst(fi);
+    Ctx.registerCreatedValue(freeze);
+    return freeze; 
+  }
   /// Finalize emission of the shuffles.
   /// \param Action the action (if any) to be performed before final applying of
   /// the \p ExtMask mask.
@@ -17451,9 +18051,9 @@ public:
                                          V, SimplifyQuery(*R.DL));
                                    }));
           unsigned InsertionIndex = Idx * getNumElements(ScalarTy);
-          Vec = createInsertVector(
-              Builder, Vec, V, InsertionIndex,
-              std::bind(&ShuffleInstructionBuilder::createShuffle, this, _1, _2,
+          Vec = SBcreateInsertVector(
+              Builder, Vec, V, InsertionIndex, Ctx,
+              std::bind(&SBShuffleInstructionBuilder::createShuffle, this, _1, _2,
                         _3));
           if (!CommonMask.empty()) {
             std::iota(std::next(CommonMask.begin(), Idx),
@@ -17625,6 +18225,110 @@ Value *BoUpSLP::vectorizeOperand(TreeEntry *E, unsigned NodeIdx) {
          "Expected only single user for the gather node.");
   assert(I->get()->isSame(VL) && "Expected same list of scalars.");
   return vectorizeTree(I->get());
+}
+
+Value *BoUpSLP::SBvectorizeOperand(TreeEntry *E, unsigned NodeIdx, sandboxir::Context &Ctx) {
+  ValueList &VL = E->getOperand(NodeIdx);
+  InstructionsState S = getSameOpcode(VL, *TLI);
+  // Special processing for GEPs bundle, which may include non-gep values.
+  if (!S && VL.front()->getType()->isPointerTy()) {
+    const auto *It = find_if(VL, IsaPred<GetElementPtrInst>);
+    if (It != VL.end())
+      S = getSameOpcode(*It, *TLI);
+  }
+  const unsigned VF = VL.size();
+  if (TreeEntry *VE = getMatchedVectorizedOperand(E, NodeIdx, VL, S)) {
+    auto FinalShuffle = [&](Value *V, ArrayRef<int> Mask) {
+      // V may be affected by MinBWs.
+      // We want ShuffleInstructionBuilder to correctly support REVEC. The key
+      // factor is the number of elements, not their type.
+      Type *ScalarTy = cast<VectorType>(V->getType())->getElementType();
+      unsigned NumElements = getNumElements(VL.front()->getType());
+      SBShuffleInstructionBuilder ShuffleBuilder(
+          NumElements != 1 ? FixedVectorType::get(ScalarTy, NumElements)
+                           : ScalarTy,
+          Ctx, Builder, *this);
+      ShuffleBuilder.add(V, Mask);
+      SmallVector<std::pair<const TreeEntry *, unsigned>> SubVectors(
+          E->CombinedEntriesWithIndices.size());
+      transform(E->CombinedEntriesWithIndices, SubVectors.begin(),
+                [&](const auto &P) {
+                  return std::make_pair(VectorizableTree[P.first].get(),
+                                        P.second);
+                });
+      assert((E->CombinedEntriesWithIndices.empty() ||
+              E->ReorderIndices.empty()) &&
+             "Expected either combined subnodes or reordering");
+      return ShuffleBuilder.finalize({}, SubVectors, {});
+    };
+    Value *V = SBvectorizeTree(VE, Ctx);
+    if (VF * getNumElements(VL[0]->getType()) !=
+        cast<FixedVectorType>(V->getType())->getNumElements()) {
+      if (!VE->ReuseShuffleIndices.empty()) {
+        // Reshuffle to get only unique values.
+        // If some of the scalars are duplicated in the vectorization
+        // tree entry, we do not vectorize them but instead generate a
+        // mask for the reuses. But if there are several users of the
+        // same entry, they may have different vectorization factors.
+        // This is especially important for PHI nodes. In this case, we
+        // need to adapt the resulting instruction for the user
+        // vectorization factor and have to reshuffle it again to take
+        // only unique elements of the vector. Without this code the
+        // function incorrectly returns reduced vector instruction with
+        // the same elements, not with the unique ones.
+
+        // block:
+        // %phi = phi <2 x > { .., %entry} {%shuffle, %block}
+        // %2 = shuffle <2 x > %phi, poison, <4 x > <1, 1, 0, 0>
+        // ... (use %2)
+        // %shuffle = shuffle <2 x> %2, poison, <2 x> {2, 0}
+        // br %block
+        SmallVector<int> Mask(VF, PoisonMaskElem);
+        for (auto [I, V] : enumerate(VL)) {
+          if (isa<PoisonValue>(V))
+            continue;
+          Mask[I] = VE->findLaneForValue(V);
+        }
+        V = FinalShuffle(V, Mask);
+      } else {
+        assert(VF < cast<FixedVectorType>(V->getType())->getNumElements() &&
+               "Expected vectorization factor less "
+               "than original vector size.");
+        SmallVector<int> UniformMask(VF, 0);
+        std::iota(UniformMask.begin(), UniformMask.end(), 0);
+        V = FinalShuffle(V, UniformMask);
+      }
+    }
+    // Need to update the operand gather node, if actually the operand is not a
+    // vectorized node, but the buildvector/gather node, which matches one of
+    // the vectorized nodes.
+    if (VE->UserTreeIndex.UserTE != E || VE->UserTreeIndex.EdgeIdx != NodeIdx) {
+      auto *It = find_if(ArrayRef(VectorizableTree).drop_front(E->Idx + 1),
+                         [&](const std::unique_ptr<TreeEntry> &TE) {
+                           return TE->isGather() &&
+                                  TE->UserTreeIndex.UserTE == E &&
+                                  TE->UserTreeIndex.EdgeIdx == NodeIdx;
+                         });
+      assert(It != VectorizableTree.end() && "Expected gather node operand.");
+      (*It)->VectorizedValue = V;
+    }
+    return V;
+  }
+
+  // Find the corresponding gather entry and vectorize it.
+  // Allows to be more accurate with tree/graph transformations, checks for the
+  // correctness of the transformations in many cases.
+  auto *I = find_if(ArrayRef(VectorizableTree).drop_front(E->Idx + 1),
+                    [E, NodeIdx](const std::unique_ptr<TreeEntry> &TE) {
+                      return TE->isOperandGatherNode({E, NodeIdx}) ||
+                             (TE->State == TreeEntry::SplitVectorize &&
+                              TE->UserTreeIndex == EdgeInfo(E, NodeIdx));
+                    });
+  assert(I != VectorizableTree.end() && "Gather node is not in the graph.");
+  assert(I->get()->UserTreeIndex &&
+         "Expected only single user for the gather node.");
+  assert(I->get()->isSame(VL) && "Expected same list of scalars.");
+  return SBvectorizeTree(I->get(), Ctx);
 }
 
 template <typename BVTy, typename ResTy, typename... Args>
@@ -18272,7 +18976,7 @@ ResTy BoUpSLP::SBprocessBuildVector(const TreeEntry *E, Type *ScalarTy,
     }
     return true;
   };
-  BVTy ShuffleBuilder(ScalarTy, Params...);
+  BVTy ShuffleBuilder(ScalarTy, Ctx, Params...);
   ResTy Res = ResTy();
   SmallVector<int> Mask;
   SmallVector<int> ExtractMask(GatheredScalars.size(), PoisonMaskElem);
@@ -18727,8 +19431,16 @@ ResTy BoUpSLP::SBprocessBuildVector(const TreeEntry *E, Type *ScalarTy,
     Res = ShuffleBuilder.createFreeze(Res);
   return Res;
 }
+
+Value *BoUpSLP::createBuildVector(const TreeEntry *E, Type *ScalarTy) {
+  for (auto [EIdx, _] : E->CombinedEntriesWithIndices)
+    (void)vectorizeTree(VectorizableTree[EIdx].get());
+  return processBuildVector<ShuffleInstructionBuilder, Value *>(
+      E, ScalarTy, Builder, *this);
+}
+
 // modified version of createBuildVector to work with sandboxir
-Value *BoUpSLP::createBuildVector(const TreeEntry *E, Type *ScalarTy,
+Value *BoUpSLP::SBcreateBuildVector(const TreeEntry *E, Type *ScalarTy,
                                   sandboxir::Context &Ctx) {
   for (auto [EIdx, _] : E->CombinedEntriesWithIndices)
     (void)SBvectorizeTree(VectorizableTree[EIdx].get(),Ctx);
@@ -19821,7 +20533,7 @@ Value *BoUpSLP::vectorizeTree(TreeEntry *E) {
 }
 
 Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
-  IRBuilderBase::InsertPointGuard Guard(Builder); // 這樣好像不用pass insert point info(sandboxir::BasicBlock *SBInsertBB, sandboxir::BBIterator &SBInsertPt)?
+  IRBuilderBase::InsertPointGuard Guard(Builder); 
 
   Value *V = E->Scalars.front();
   Type *ScalarTy = V->getType();
@@ -19840,23 +20552,23 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
     if (E->hasState() && E->Idx == 0 && !UserIgnoreList)
       setInsertPointAfterBundle(E);
     // --- set insert point for sandboxir ---
-    llvm::BasicBlock *LlvmBB = Builder.GetInsertBlock();
-    llvm::BasicBlock::iterator LlvmIt = Builder.GetInsertPoint();
+    // llvm::BasicBlock *LlvmBB = Builder.GetInsertBlock();
+    // llvm::BasicBlock::iterator LlvmIt = Builder.GetInsertPoint();
 
-    sandboxir::BasicBlock *SbBB = dyn_cast_or_null<sandboxir::BasicBlock>(Ctx.getValue(LlvmBB));
-    assert(SbBB && "Current BasicBlock not in SandboxIR Context");
+    // sandboxir::BasicBlock *SbBB = dyn_cast_or_null<sandboxir::BasicBlock>(Ctx.getValue(LlvmBB));
+    // assert(SbBB && "Current BasicBlock not in SandboxIR Context");
 
-    sandboxir::BBIterator SbBIt;
-    if (LlvmIt == LlvmBB->end()) {
-        SbBIt = SbBB->end();
-    } else {
-        sandboxir::Instruction *SbBeforeInst = dyn_cast_or_null<sandboxir::Instruction>(Ctx.getValue(&*LlvmIt));
-        assert(SbBeforeInst && "Instruction at LLVM insert point not in SandboxIR context");
-        SbBIt = SbBeforeInst->getIterator();
-    }
-    sandboxir::InsertPosition SBInsertPos(SbBIt);
+    // sandboxir::BBIterator SbBIt;
+    // if (LlvmIt == LlvmBB->end()) {
+    //     SbBIt = SbBB->end();
+    // } else {
+    //     sandboxir::Instruction *SbBeforeInst = dyn_cast_or_null<sandboxir::Instruction>(Ctx.getValue(&*LlvmIt));
+    //     assert(SbBeforeInst && "Instruction at LLVM insert point not in SandboxIR context");
+    //     SbBIt = SbBeforeInst->getIterator();
+    // }
+    // sandboxir::InsertPosition SBInsertPos(SbBIt);
     // --- end of set insert point for sandboxir ---
-    Value *Vec = createBuildVector(E, ScalarTy, Ctx);
+    Value *Vec = SBcreateBuildVector(E, ScalarTy, Ctx);
     E->VectorizedValue = Vec;
     return Vec;
   }
@@ -19869,13 +20581,13 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
     assert(OpTE1.isSame(
                ArrayRef(E->Scalars).take_front(OpTE1.getVectorFactor())) &&
            "Expected same first part of scalars.");
-    Value *Op1 = SBvectorizeTree(&OpTE1, Ctx); // may need SBInsertBB, SBInsertPt or try to restore insert point state
+    Value *Op1 = SBvectorizeTree(&OpTE1, Ctx);
     TreeEntry &OpTE2 =
         *VectorizableTree[E->CombinedEntriesWithIndices.back().first].get();
     assert(
         OpTE2.isSame(ArrayRef(E->Scalars).take_back(OpTE2.getVectorFactor())) &&
         "Expected same second part of scalars.");
-    Value *Op2 = SBvectorizeTree(&OpTE2, Ctx); // may need SBInsertBB, SBInsertPt
+    Value *Op2 = SBvectorizeTree(&OpTE2, Ctx);
     auto GetOperandSignedness = [&](const TreeEntry *OpE) {
       bool IsSigned = false;
       auto It = MinBWs.find(OpE);
@@ -19898,6 +20610,12 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
               ScalarTy,
               cast<FixedVectorType>(Op1->getType())->getNumElements()),
           GetOperandSignedness(&OpTE1));
+      // for sandboxir
+      // if (auto *sic = dyn_cast<CastInst>(Op1)) 
+      //   Ctx.createCastInst(sic);
+      // else if (auto *c = dyn_cast<Constant>(Op1)) 
+      //   Ctx.getOrCreateConstant(c);
+      Ctx.registerCreatedValue(Op1);
     }
     if (cast<VectorType>(Op2->getType())->getElementType() !=
         ScalarTy->getScalarType()) {
@@ -19908,6 +20626,12 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
               ScalarTy,
               cast<FixedVectorType>(Op2->getType())->getNumElements()),
           GetOperandSignedness(&OpTE2));
+      // for sandboxir
+      // if (auto *sic = dyn_cast<CastInst>(Op2)) 
+      //   Ctx.createCastInst(sic);
+      // else if (auto *c = dyn_cast<Constant>(Op2)) 
+      //   Ctx.getOrCreateConstant(c);
+      Ctx.registerCreatedValue(Op2);
     }
     if (E->ReorderIndices.empty()) {
       SmallVector<int> Mask(E->getVectorFactor(), PoisonMaskElem);
@@ -19921,9 +20645,17 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
         transformScalarShuffleIndiciesToVector(ScalarTyNumElements, Mask);
       }
       Value *Vec = Builder.CreateShuffleVector(Op1, Mask);
-      Vec = createInsertVector(Builder, Vec, Op2,
+      // for sandboxir
+      // if (auto *svi = dyn_cast<ShuffleVectorInst>(Vec)) 
+      //   Ctx.createShuffleVectorInst(svi);
+      // else if (auto *c = dyn_cast<Constant>(Vec)) 
+      //   Ctx.getOrCreateConstant(c);
+      // else 
+      //   llvm_unreachable("Unhandled Vec type!");
+      Ctx.registerCreatedValue(Vec);
+      Vec = SBcreateInsertVector(Builder, Vec, Op2,
                                E->CombinedEntriesWithIndices.back().second *
-                                   ScalarTyNumElements);
+                                   ScalarTyNumElements, Ctx);
       E->VectorizedValue = Vec;
       return Vec;
     }
@@ -19934,14 +20666,38 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
       std::iota(Mask.begin(), std::next(Mask.begin(), OpTE1.getVectorFactor()),
                 0);
       Op1 = Builder.CreateShuffleVector(Op1, Mask);
+      // for sandboxir
+      // if (auto *svi = dyn_cast<ShuffleVectorInst>(Op1)) 
+      //   Ctx.createShuffleVectorInst(svi);
+      // else if (auto *c = dyn_cast<Constant>(Op1)) 
+      //   Ctx.getOrCreateConstant(c);
+      // else 
+      //   llvm_unreachable("Unhandled Op1 type!");
+      Ctx.registerCreatedValue(Op1);
     }
     if (getNumElements(Op2->getType()) != CommonVF) {
       SmallVector<int> Mask(CommonVF, PoisonMaskElem);
       std::iota(Mask.begin(), std::next(Mask.begin(), OpTE2.getVectorFactor()),
                 0);
       Op2 = Builder.CreateShuffleVector(Op2, Mask);
+      // for sandboxir
+      // if (auto *svi = dyn_cast<ShuffleVectorInst>(Op2)) 
+      //   Ctx.createShuffleVectorInst(svi);
+      // else if (auto *c = dyn_cast<Constant>(Op2)) 
+      //   Ctx.getOrCreateConstant(c);
+      // else 
+      //   llvm_unreachable("Unhandled Op2 type!");
+      Ctx.registerCreatedValue(Op2);
     }
     Value *Vec = Builder.CreateShuffleVector(Op1, Op2, E->getSplitMask());
+    // for sandboxir
+    // if (auto *svi = dyn_cast<ShuffleVectorInst>(Vec)) 
+    //   Ctx.createShuffleVectorInst(svi);
+    // else if (auto *c = dyn_cast<Constant>(Vec)) 
+    //   Ctx.getOrCreateConstant(c);
+    // else 
+    //   llvm_unreachable("Unhandled Vec type!");
+    Ctx.registerCreatedValue(Vec);
     E->VectorizedValue = Vec;
     return Vec;
   }
@@ -19949,7 +20705,7 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
   bool IsReverseOrder =
       !E->ReorderIndices.empty() && isReverseOrder(E->ReorderIndices);
   auto FinalShuffle = [&](Value *V, const TreeEntry *E) {
-    ShuffleInstructionBuilder ShuffleBuilder(ScalarTy, Builder, *this);
+    SBShuffleInstructionBuilder ShuffleBuilder(ScalarTy, Ctx, Builder, *this);
     if (E->getOpcode() == Instruction::Store &&
         E->State == TreeEntry::Vectorize) {
       ArrayRef<int> Mask =
@@ -19992,6 +20748,7 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
       });
     return IsSigned;
   };
+  // Supporting sandbox ir
   switch (ShuffleOrOp) {
     case Instruction::PHI: {
       assert((E->ReorderIndices.empty() || !E->ReuseShuffleIndices.empty() ||
@@ -20001,7 +20758,9 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
       Builder.SetInsertPoint(PH->getParent(),
                              PH->getParent()->getFirstNonPHIIt());
       Builder.SetCurrentDebugLocation(PH->getDebugLoc());
-      PHINode *NewPhi = Builder.CreatePHI(VecTy, PH->getNumIncomingValues()); // be careful of the vecty value!!
+      PHINode *NewPhi = Builder.CreatePHI(VecTy, PH->getNumIncomingValues());
+      // for sandboxir
+      sandboxir::PHINode *SBNewPhi = dyn_cast<sandboxir::PHINode>(Ctx.registerCreatedValue(NewPhi));
       Value *V = NewPhi;
 
       // Adjust insertion point once all PHI's have been generated.
@@ -20032,7 +20791,8 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
 
         if (!VisitedBBs.insert(IBB).second) {
           Value *VecOp = NewPhi->getIncomingValueForBlock(IBB);
-          NewPhi->addIncoming(VecOp, IBB);
+          // NewPhi->addIncoming(VecOp, IBB);
+          SBNewPhi->addIncoming(Ctx.getValue(VecOp), dyn_cast<sandboxir::BasicBlock>(Ctx.getValue(IBB)));
           TreeEntry *OpTE = getOperandEntry(E, I);
           OpTE->VectorizedValue = VecOp;
           continue;
@@ -20040,14 +20800,21 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
 
         Builder.SetInsertPoint(IBB->getTerminator());
         Builder.SetCurrentDebugLocation(PH->getDebugLoc());
-        Value *Vec = vectorizeOperand(E, I);
+        Value *Vec = SBvectorizeOperand(E, I, Ctx);
         if (VecTy != Vec->getType()) {
           assert((It != MinBWs.end() || getOperandEntry(E, I)->isGather() ||
                   MinBWs.contains(getOperandEntry(E, I))) &&
                  "Expected item in MinBWs.");
           Vec = Builder.CreateIntCast(Vec, VecTy, GetOperandSignedness(I));
+          // for sandbox ir
+          // if (auto *sic = dyn_cast<CastInst>(Vec)) 
+          //   Ctx.createCastInst(sic);
+          // else if (auto *c = dyn_cast<Constant>(Vec)) 
+          //   Ctx.getOrCreateConstant(c);
+          Ctx.registerCreatedValue(Vec);
         }
-        NewPhi->addIncoming(Vec, IBB);
+        // NewPhi->addIncoming(Vec, IBB);
+        SBNewPhi->addIncoming(Ctx.getValue(Vec), dyn_cast<sandboxir::BasicBlock>(Ctx.getValue(IBB)));
       }
 
       assert(NewPhi->getNumIncomingValues() == PH->getNumIncomingValues() &&
@@ -20068,6 +20835,9 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
       Builder.SetInsertPoint(LI);
       Value *Ptr = LI->getPointerOperand();
       LoadInst *V = Builder.CreateAlignedLoad(VecTy, Ptr, LI->getAlign());
+      // for sandboxir
+      // Ctx.createLoadInst(V);  
+      Ctx.registerCreatedValue(V);
       Value *NewV = ::propagateMetadata(V, E->Scalars);
       NewV = FinalShuffle(NewV, E);
       E->VectorizedValue = NewV;
@@ -20076,7 +20846,7 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
     case Instruction::InsertElement: {
       assert(E->ReuseShuffleIndices.empty() && "All inserts should be unique");
       Builder.SetInsertPoint(cast<Instruction>(E->Scalars.back()));
-      Value *V = vectorizeOperand(E, 1);
+      Value *V = SBvectorizeOperand(E, 1, Ctx);
       ArrayRef<Value *> Op = E->getOperand(1);
       Type *ScalarTy = Op.front()->getType();
       if (cast<VectorType>(V->getType())->getElementType() != ScalarTy) {
@@ -20089,6 +20859,12 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
                 ScalarTy,
                 cast<FixedVectorType>(V->getType())->getNumElements()),
             Res.second);
+        // for sandboxir
+        // if (auto *sic = dyn_cast<CastInst>(V)) 
+        //   Ctx.createCastInst(sic);
+        // else if (auto *c = dyn_cast<Constant>(V)) 
+        //   Ctx.getOrCreateConstant(c);
+        Ctx.registerCreatedValue(V);
       }
 
       // Create InsertVector shuffle if necessary
@@ -20174,6 +20950,13 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
         if (!V2)
           V2 = PoisonValue::get(V->getType());
         V = Builder.CreateShuffleVector(V, V2, InsertMask);
+        // for sandboxir
+        // if (auto *svi = dyn_cast<ShuffleVectorInst>(V)) 
+        //   Ctx.createShuffleVectorInst(svi);
+        // else if (auto *c = dyn_cast<Constant>(V)) 
+        //   Ctx.getOrCreateConstant(c);
+        Ctx.registerCreatedValue(V);
+
         if (auto *I = dyn_cast<Instruction>(V)) {
           GatherShuffleExtractSeq.insert(I);
           CSEBlocks.insert(I->getParent());
@@ -20206,6 +20989,13 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
                 IsFirstPoison.all() ? PoisonValue::get(V->getType())
                                     : FirstInsert->getOperand(0),
                 InsertMask, cast<Instruction>(E->Scalars.back())->getName());
+            // for sandboxir
+            // if (auto *svi = dyn_cast<ShuffleVectorInst>(V)) 
+            //   Ctx.createShuffleVectorInst(svi);
+            // else if (auto *c = dyn_cast<Constant>(V)) 
+            //   Ctx.getOrCreateConstant(c);
+            Ctx.registerCreatedValue(V);
+
             if (auto *I = dyn_cast<Instruction>(V)) {
               GatherShuffleExtractSeq.insert(I);
               CSEBlocks.insert(I->getParent());
@@ -20223,6 +21013,13 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
           V = Builder.CreateShuffleVector(
               FirstInsert->getOperand(0), V, InsertMask,
               cast<Instruction>(E->Scalars.back())->getName());
+          // for sandboxir
+          // if (auto *svi = dyn_cast<ShuffleVectorInst>(V)) 
+          //   Ctx.createShuffleVectorInst(svi);
+          // else if (auto *c = dyn_cast<Constant>(V)) 
+          //   Ctx.getOrCreateConstant(c);
+          Ctx.registerCreatedValue(V);
+          
           if (auto *I = dyn_cast<Instruction>(V)) {
             GatherShuffleExtractSeq.insert(I);
             CSEBlocks.insert(I->getParent());
@@ -20248,7 +21045,7 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
     case Instruction::BitCast: {
       setInsertPointAfterBundle(E);
 
-      Value *InVec = vectorizeOperand(E, 0);
+      Value *InVec = SBvectorizeOperand(E, 0, Ctx);
 
       auto *CI = cast<CastInst>(VL0);
       Instruction::CastOps VecOpcode = CI->getOpcode();
@@ -20281,6 +21078,14 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
       Value *V = (VecOpcode != ShuffleOrOp && VecOpcode == Instruction::BitCast)
                      ? InVec
                      : Builder.CreateCast(VecOpcode, InVec, VecTy);
+      // for sandboxir
+      if (VecOpcode == ShuffleOrOp || VecOpcode != Instruction::BitCast) {
+        // if (auto *ci = dyn_cast<CastInst>(V)) 
+        //   Ctx.createCastInst(ci);
+        // else if (auto *c = dyn_cast<Constant>(V)) 
+        //   Ctx.getOrCreateConstant(c);
+        Ctx.registerCreatedValue(V);
+      }
       V = FinalShuffle(V, E);
 
       E->VectorizedValue = V;
@@ -20291,8 +21096,8 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
     case Instruction::ICmp: {
       setInsertPointAfterBundle(E);
 
-      Value *L = vectorizeOperand(E, 0);
-      Value *R = vectorizeOperand(E, 1);
+      Value *L = SBvectorizeOperand(E, 0, Ctx);
+      Value *R = SBvectorizeOperand(E, 1, Ctx);
       if (L->getType() != R->getType()) {
         assert((getOperandEntry(E, 0)->isGather() ||
                 getOperandEntry(E, 1)->isGather() ||
@@ -20306,14 +21111,33 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
                                              ->getIntegerBitWidth()) {
           Type *CastTy = R->getType();
           L = Builder.CreateIntCast(L, CastTy, GetOperandSignedness(0));
+          // for sandboxir
+          // if (auto *sic = dyn_cast<CastInst>(L)) 
+          //   Ctx.createCastInst(sic);
+          // else if (auto *c = dyn_cast<Constant>(L)) 
+          //   Ctx.getOrCreateConstant(c);
+          Ctx.registerCreatedValue(L);
         } else {
           Type *CastTy = L->getType();
           R = Builder.CreateIntCast(R, CastTy, GetOperandSignedness(1));
+          // for sandboxir
+          // if (auto *sic = dyn_cast<CastInst>(R)) 
+          //   Ctx.createCastInst(sic);
+          // else if (auto *c = dyn_cast<Constant>(R)) 
+          //   Ctx.getOrCreateConstant(c);
+          Ctx.registerCreatedValue(R);
         }
       }
 
       CmpInst::Predicate P0 = cast<CmpInst>(VL0)->getPredicate();
       Value *V = Builder.CreateCmp(P0, L, R);
+      // for sandboxir
+      // if (auto *icmpi = dyn_cast<ICmpInst>(V)) {
+      //   Ctx.createICmpInst(icmpi);
+      // } else if (auto *fcmpi = dyn_cast<FCmpInst>(V)) {
+      //   Ctx.createFCmpInst(fcmpi);
+      // }
+      Ctx.registerCreatedValue(V);
       propagateIRFlags(V, E->Scalars, VL0);
       if (auto *ICmp = dyn_cast<ICmpInst>(V); ICmp && It == MinBWs.end())
         ICmp->setSameSign(/*B=*/false);
@@ -20328,19 +21152,33 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
     case Instruction::Select: {
       setInsertPointAfterBundle(E);
 
-      Value *Cond = vectorizeOperand(E, 0);
-      Value *True = vectorizeOperand(E, 1);
-      Value *False = vectorizeOperand(E, 2);
+      Value *Cond = SBvectorizeOperand(E, 0, Ctx);
+      Value *True = SBvectorizeOperand(E, 1, Ctx);
+      Value *False = SBvectorizeOperand(E, 2, Ctx);
       if (True->getType() != VecTy || False->getType() != VecTy) {
         assert((It != MinBWs.end() || getOperandEntry(E, 1)->isGather() ||
                 getOperandEntry(E, 2)->isGather() ||
                 MinBWs.contains(getOperandEntry(E, 1)) ||
                 MinBWs.contains(getOperandEntry(E, 2))) &&
                "Expected item in MinBWs.");
-        if (True->getType() != VecTy)
+        if (True->getType() != VecTy) {
           True = Builder.CreateIntCast(True, VecTy, GetOperandSignedness(1));
-        if (False->getType() != VecTy)
+          // for sandboxir
+          // if (auto *sic = dyn_cast<CastInst>(True)) 
+          //   Ctx.createCastInst(sic);
+          // else if (auto *c = dyn_cast<Constant>(True)) 
+          //   Ctx.getOrCreateConstant(c);
+          Ctx.registerCreatedValue(True);
+        }
+        if (False->getType() != VecTy) {
           False = Builder.CreateIntCast(False, VecTy, GetOperandSignedness(2));
+          // for sandboxir
+          // if (auto *sic = dyn_cast<CastInst>(False)) 
+          //   Ctx.createCastInst(sic);
+          // else if (auto *c = dyn_cast<Constant>(False)) 
+          //   Ctx.getOrCreateConstant(c);
+          Ctx.registerCreatedValue(False);
+        }
       }
 
       unsigned CondNumElements = getNumElements(Cond->getType());
@@ -20356,10 +21194,23 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
         Cond = Builder.CreateShuffleVector(
             Cond, createReplicatedMask(TrueNumElements / CondNumElements,
                                        CondNumElements));
+        // for sandboxir
+        // if (auto *svi = dyn_cast<ShuffleVectorInst>(Cond)) 
+        //   Ctx.createShuffleVectorInst(svi);
+        // else if (auto *c = dyn_cast<Constant>(Cond)) 
+        //   Ctx.getOrCreateConstant(c);
+        Ctx.registerCreatedValue(Cond);
       }
       assert(getNumElements(Cond->getType()) == TrueNumElements &&
              "Cannot vectorize Instruction::Select");
       Value *V = Builder.CreateSelect(Cond, True, False);
+      // for sandboxir
+      // if (auto *selecti = dyn_cast<SelectInst>(V)) 
+      //   Ctx.createSelectInst(selecti);
+      // else if (auto *c = dyn_cast<Constant>(V)) 
+      //   Ctx.getOrCreateConstant(c);
+      Ctx.registerCreatedValue(V);
+
       V = FinalShuffle(V, E);
 
       E->VectorizedValue = V;
@@ -20369,10 +21220,17 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
     case Instruction::FNeg: {
       setInsertPointAfterBundle(E);
 
-      Value *Op = vectorizeOperand(E, 0);
+      Value *Op = SBvectorizeOperand(E, 0, Ctx);
 
       Value *V = Builder.CreateUnOp(
           static_cast<Instruction::UnaryOps>(E->getOpcode()), Op);
+      // for sandboxir
+      // if (auto *unop = dyn_cast<UnaryOperator>(V)) 
+      //   Ctx.createUnaryOperator(unop);
+      // else if (auto *c = dyn_cast<Constant>(V)) 
+      //   Ctx.getOrCreateConstant(c);
+      Ctx.registerCreatedValue(V);
+
       propagateIRFlags(V, E->Scalars, VL0);
       if (auto *I = dyn_cast<Instruction>(V))
         V = ::propagateMetadata(I, E->Scalars);
@@ -20387,15 +21245,26 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
     case Instruction::Freeze: {
       setInsertPointAfterBundle(E);
 
-      Value *Op = vectorizeOperand(E, 0);
+      Value *Op = SBvectorizeOperand(E, 0, Ctx);
 
       if (Op->getType() != VecTy) {
         assert((It != MinBWs.end() || getOperandEntry(E, 0)->isGather() ||
                 MinBWs.contains(getOperandEntry(E, 0))) &&
                "Expected item in MinBWs.");
         Op = Builder.CreateIntCast(Op, VecTy, GetOperandSignedness(0));
+        // for sandboxir
+        // if (auto *sic = dyn_cast<CastInst>(Op)) 
+        //   Ctx.createCastInst(sic);
+        // else if (auto *c = dyn_cast<Constant>(Op)) 
+        //   Ctx.getOrCreateConstant(c);
+        Ctx.registerCreatedValue(Op);
       }
       Value *V = Builder.CreateFreeze(Op);
+      // for sandboxir
+      // if (auto *freezei = dyn_cast<FreezeInst>(V)) 
+      //   Ctx.createFreezeInst(freezei);
+      Ctx.registerCreatedValue(V);
+
       V = FinalShuffle(V, E);
 
       E->VectorizedValue = V;
@@ -20423,8 +21292,8 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
     case Instruction::Xor: {
       setInsertPointAfterBundle(E);
 
-      Value *LHS = vectorizeOperand(E, 0);
-      Value *RHS = vectorizeOperand(E, 1);
+      Value *LHS = SBvectorizeOperand(E, 0, Ctx);
+      Value *RHS = SBvectorizeOperand(E, 1, Ctx);
       if (ShuffleOrOp == Instruction::And && It != MinBWs.end()) {
         for (unsigned I : seq<unsigned>(0, E->getNumOperands())) {
           ArrayRef<Value *> Ops = E->getOperand(I);
@@ -20445,15 +21314,36 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
                 MinBWs.contains(getOperandEntry(E, 0)) ||
                 MinBWs.contains(getOperandEntry(E, 1))) &&
                "Expected item in MinBWs.");
-        if (LHS->getType() != VecTy)
+        if (LHS->getType() != VecTy) {
           LHS = Builder.CreateIntCast(LHS, VecTy, GetOperandSignedness(0));
-        if (RHS->getType() != VecTy)
+          // for sandboxir
+          // if (auto *sic = dyn_cast<CastInst>(LHS)) 
+          //   Ctx.createCastInst(sic);
+          // else if (auto *c = dyn_cast<Constant>(LHS)) 
+          //   Ctx.getOrCreateConstant(c);
+          Ctx.registerCreatedValue(LHS);
+        }
+        if (RHS->getType() != VecTy) {
           RHS = Builder.CreateIntCast(RHS, VecTy, GetOperandSignedness(1));
+          // for sandboxir
+          // if (auto *sic = dyn_cast<CastInst>(RHS)) 
+          //   Ctx.createCastInst(sic);
+          // else if (auto *c = dyn_cast<Constant>(RHS)) 
+          //   Ctx.getOrCreateConstant(c);
+          Ctx.registerCreatedValue(RHS);
+        }
       }
 
       Value *V = Builder.CreateBinOp(
           static_cast<Instruction::BinaryOps>(E->getOpcode()), LHS,
           RHS);
+      // for sandboxir
+      // if (auto *binopi = dyn_cast<BinaryOperator>(V)) 
+      //   Ctx.createBinaryOperator(binopi);
+      // else if (auto *c = dyn_cast<Constant>(V)) 
+      //   Ctx.getOrCreateConstant(c);
+      Ctx.registerCreatedValue(V);
+
       propagateIRFlags(V, E->Scalars, nullptr, It == MinBWs.end());
       if (auto *I = dyn_cast<Instruction>(V)) {
         V = ::propagateMetadata(I, E->Scalars);
@@ -20461,8 +21351,12 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
         if (!MinBWs.contains(E) && ShuffleOrOp == Instruction::Sub &&
             any_of(E->Scalars, [](Value *V) {
               return isa<PoisonValue>(V) || isCommutative(cast<Instruction>(V));
-            }))
-          I->setHasNoUnsignedWrap(/*b=*/false);
+            })) {
+              // I->setHasNoUnsignedWrap(/*b=*/false);
+              sandboxir::Instruction *sbi = dyn_cast<sandboxir::Instruction>(Ctx.getValue(I));
+              sbi->setHasNoUnsignedWrap(/*b=*/false);
+            }
+          
       }
 
       V = FinalShuffle(V, E);
@@ -20482,6 +21376,9 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
       Value *PO = LI->getPointerOperand();
       if (E->State == TreeEntry::Vectorize) {
         NewLI = Builder.CreateAlignedLoad(VecTy, PO, LI->getAlign());
+        // for sandboxir
+        // Ctx.createLoadInst(dyn_cast<LoadInst>(NewLI));
+        Ctx.registerCreatedValue(NewLI);
       } else if (E->State == TreeEntry::CompressVectorize) {
         SmallVector<Value *> Scalars(E->Scalars.begin(), E->Scalars.end());
         if (!E->ReorderIndices.empty()) {
@@ -20509,8 +21406,20 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
           Constant *MaskValue = ConstantVector::get(MaskValues);
           NewLI = Builder.CreateMaskedLoad(LoadVecTy, PO, CommonAlignment,
                                            MaskValue);
+          // for sandboxir
+          // if (auto *loadi = dyn_cast<CallInst>(NewLI)) 
+          //   Ctx.createCallInst(loadi);
+          // else 
+          //   llvm_unreachable("Expected CallInst");
+          Ctx.registerCreatedValue(NewLI);
         } else {
           NewLI = Builder.CreateAlignedLoad(LoadVecTy, PO, CommonAlignment);
+          // for sandboxir
+          // if (auto *loadi = dyn_cast<LoadInst>(NewLI)) 
+          //   Ctx.createLoadInst(loadi);
+          // else 
+          //   llvm_unreachable("Expected LoadInst");
+          Ctx.registerCreatedValue(NewLI);
         }
         NewLI = ::propagateMetadata(NewLI, E->Scalars);
         // TODO: include this cost into CommonCost.
@@ -20521,6 +21430,14 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
         }
         NewLI =
             cast<Instruction>(Builder.CreateShuffleVector(NewLI, CompressMask));
+        // for sandboxir
+        // if (auto *svi = dyn_cast<ShuffleVectorInst>(NewLI)) 
+        //   Ctx.createShuffleVectorInst(svi);
+        // else if (auto *c = dyn_cast<Constant>(NewLI)) 
+        //   Ctx.getOrCreateConstant(c);
+        // else 
+        //   llvm_unreachable("Expected ShuffleVectorInst");
+        Ctx.registerCreatedValue(NewLI);
       } else if (E->State == TreeEntry::StridedVectorize) {
         Value *Ptr0 = cast<LoadInst>(E->Scalars.front())->getPointerOperand();
         Value *PtrN = cast<LoadInst>(E->Scalars.back())->getPointerOperand();
@@ -20545,12 +21462,27 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
                                 &*Builder.GetInsertPoint());
           Value *NewStride =
               Builder.CreateIntCast(*Stride, StrideTy, /*isSigned=*/true);
+          // for sandboxir
+          // if (auto *sic = dyn_cast<CastInst>(NewStride)) 
+          //   Ctx.createCastInst(sic);
+          // else if (auto *c = dyn_cast<Constant>(NewStride)) 
+          //   Ctx.getOrCreateConstant(c);
+          Ctx.registerCreatedValue(NewStride);
+
           StrideVal = Builder.CreateMul(
               NewStride,
               ConstantInt::get(
                   StrideTy,
                   (IsReverseOrder ? -1 : 1) *
                       static_cast<int>(DL->getTypeAllocSize(ScalarTy))));
+          // for sandboxir
+          // if (auto *mul = dyn_cast<BinaryOperator>(StrideVal)) 
+          //   Ctx.createBinaryOperator(mul);
+          // else if (auto *c = dyn_cast<Constant>(StrideVal)) 
+          //   Ctx.getOrCreateConstant(c);
+          // else 
+          //   llvm_unreachable("Expected BinaryOperator");
+          Ctx.registerCreatedValue(StrideVal);
         }
         Align CommonAlignment = computeCommonAlignment<LoadInst>(E->Scalars);
         auto *Inst = Builder.CreateIntrinsic(
@@ -20558,13 +21490,19 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
             {VecTy, PO->getType(), StrideTy},
             {PO, StrideVal, Builder.getAllOnesMask(VecTy->getElementCount()),
              Builder.getInt32(E->Scalars.size())});
+        // for sandboxir
+        // if (auto *calli = dyn_cast<CallInst>(Inst)) 
+        //   Ctx.createCallInst(calli);
+        // else 
+        //   llvm_unreachable("Expected CallInst");
+        Ctx.registerCreatedValue(Inst);
         Inst->addParamAttr(
             /*ArgNo=*/0,
             Attribute::getWithAlignment(Inst->getContext(), CommonAlignment));
         NewLI = Inst;
       } else {
         assert(E->State == TreeEntry::ScatterVectorize && "Unhandled state");
-        Value *VecPtr = vectorizeOperand(E, 0);
+        Value *VecPtr = SBvectorizeOperand(E, 0, Ctx);
         if (isa<FixedVectorType>(ScalarTy)) {
           assert(SLPReVec && "FixedVectorType is not expected.");
           // CreateMaskedGather expects VecTy and VecPtr have same size. We need
@@ -20580,15 +21518,36 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
           transform(seq(VecTyNumElements), Indices.begin(), [=](unsigned I) {
             return Builder.getInt64(I % ScalarTyNumElements);
           });
-          VecPtr = Builder.CreateGEP(
-              VecTy->getElementType(),
-              Builder.CreateShuffleVector(
-                  VecPtr, createReplicatedMask(ScalarTyNumElements, VF)),
-              ConstantVector::get(Indices));
+          Value *tempshuffle = Builder.CreateShuffleVector(
+                  VecPtr, createReplicatedMask(ScalarTyNumElements, VF));
+          // for sandboxir
+          // if (auto *svi = dyn_cast<ShuffleVectorInst>(tempshuffle)) 
+          //   Ctx.createShuffleVectorInst(svi);
+          // else if (auto *c = dyn_cast<Constant>(tempshuffle)) 
+          //   Ctx.getOrCreateConstant(c);
+          // else 
+          //   llvm_unreachable("Expected ShuffleVectorInst");
+          Ctx.registerCreatedValue(tempshuffle);
+
+          VecPtr = Builder.CreateGEP(VecTy->getElementType(), tempshuffle, ConstantVector::get(Indices));
+          // for sandboxir
+          // if (auto *gepi = dyn_cast<GetElementPtrInst>(VecPtr)) 
+          //   Ctx.createGetElementPtrInst(gepi);
+          // else if (auto *c = dyn_cast<Constant>(VecPtr)) 
+          //   Ctx.getOrCreateConstant(c);
+          // else 
+          //   llvm_unreachable("Expected GetElementPtrInst");
+          Ctx.registerCreatedValue(VecPtr);
         }
         // Use the minimum alignment of the gathered loads.
         Align CommonAlignment = computeCommonAlignment<LoadInst>(E->Scalars);
         NewLI = Builder.CreateMaskedGather(VecTy, VecPtr, CommonAlignment);
+        // for sandboxir
+        // if (auto *calli = dyn_cast<CallInst>(NewLI)) 
+        //   Ctx.createCallInst(calli);
+        // else 
+        //   llvm_unreachable("Expected CallInst");
+        Ctx.registerCreatedValue(NewLI);
       }
       Value *V = E->State == TreeEntry::CompressVectorize
                      ? NewLI
@@ -20604,16 +21563,27 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
 
       setInsertPointAfterBundle(E);
 
-      Value *VecValue = vectorizeOperand(E, 0);
-      if (VecValue->getType() != VecTy)
+      Value *VecValue = SBvectorizeOperand(E, 0, Ctx);
+      if (VecValue->getType() != VecTy) {
         VecValue =
             Builder.CreateIntCast(VecValue, VecTy, GetOperandSignedness(0));
+        // for sandboxir
+        // if (auto *sic = dyn_cast<CastInst>(VecValue)) 
+        //   Ctx.createCastInst(sic);
+        // else if (auto *c = dyn_cast<Constant>(VecValue)) 
+        //   Ctx.getOrCreateConstant(c);
+        Ctx.registerCreatedValue(VecValue);
+      }
+        
       VecValue = FinalShuffle(VecValue, E);
 
       Value *Ptr = SI->getPointerOperand();
       Instruction *ST;
       if (E->State == TreeEntry::Vectorize) {
         ST = Builder.CreateAlignedStore(VecValue, Ptr, SI->getAlign());
+        // for sandboxir
+        // Ctx.createStoreInst(ST);
+        Ctx.registerCreatedValue(ST);
       } else {
         assert(E->State == TreeEntry::StridedVectorize &&
                "Expected either strided or consecutive stores.");
@@ -20631,6 +21601,12 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
                  StrideTy, -static_cast<int>(DL->getTypeAllocSize(ScalarTy))),
              Builder.getAllOnesMask(VecTy->getElementCount()),
              Builder.getInt32(E->Scalars.size())});
+        // for sandboxir
+        // if (auto *calli = dyn_cast<CallInst>(Inst)) 
+        //   Ctx.createCallInst(calli);
+        // else 
+        //   llvm_unreachable("Expected CallInst");
+        Ctx.registerCreatedValue(Inst);
         Inst->addParamAttr(
             /*ArgNo=*/1,
             Attribute::getWithAlignment(Inst->getContext(), CommonAlignment));
@@ -20647,15 +21623,23 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
       auto *GEP0 = cast<GetElementPtrInst>(VL0);
       setInsertPointAfterBundle(E);
 
-      Value *Op0 = vectorizeOperand(E, 0);
+      Value *Op0 = SBvectorizeOperand(E, 0, Ctx);
 
       SmallVector<Value *> OpVecs;
       for (int J = 1, N = GEP0->getNumOperands(); J < N; ++J) {
-        Value *OpVec = vectorizeOperand(E, J);
+        Value *OpVec = SBvectorizeOperand(E, J, Ctx);
         OpVecs.push_back(OpVec);
       }
 
       Value *V = Builder.CreateGEP(GEP0->getSourceElementType(), Op0, OpVecs);
+      // for sandboxir
+      // if (auto *gepi = dyn_cast<GetElementPtrInst>(V)) 
+      //   Ctx.createGetElementPtrInst(gepi);
+      // else if (auto *c = dyn_cast<Constant>(V)) 
+      //   Ctx.getOrCreateConstant(c);
+      // else 
+      //   llvm_unreachable("Expected GetElementPtrInst");
+      Ctx.registerCreatedValue(V);
       if (Instruction *I = dyn_cast<GetElementPtrInst>(V)) {
         SmallVector<Value *> GEPs;
         for (Value *V : E->Scalars) {
@@ -20709,7 +21693,7 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
           continue;
         }
 
-        Value *OpVec = vectorizeOperand(E, I);
+        Value *OpVec = SBvectorizeOperand(E, I, Ctx);
         ScalarArg = CEI->getArgOperand(I);
         if (cast<VectorType>(OpVec->getType())->getElementType() !=
                 ScalarArg->getType()->getScalarType() &&
@@ -20717,8 +21701,20 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
           auto *CastTy =
               getWidenedType(ScalarArg->getType(), VecTy->getNumElements());
           OpVec = Builder.CreateIntCast(OpVec, CastTy, GetOperandSignedness(I));
+          // for sandboxir
+          // if (auto *sic = dyn_cast<CastInst>(OpVec)) 
+          //   Ctx.createCastInst(sic);
+          // else if (auto *c = dyn_cast<Constant>(OpVec)) 
+          //   Ctx.getOrCreateConstant(c);
+          Ctx.registerCreatedValue(OpVec);
         } else if (It != MinBWs.end()) {
           OpVec = Builder.CreateIntCast(OpVec, VecTy, GetOperandSignedness(I));
+          // for sandboxir
+          // if (auto *sic = dyn_cast<CastInst>(OpVec)) 
+          //   Ctx.createCastInst(sic);
+          // else if (auto *c = dyn_cast<Constant>(OpVec)) 
+          //   Ctx.getOrCreateConstant(c);
+          Ctx.registerCreatedValue(OpVec);
         }
         LLVM_DEBUG(dbgs() << "SLP: OpVec[" << I << "]: " << *OpVec << "\n");
         OpVecs.push_back(OpVec);
@@ -20742,6 +21738,13 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
       CI->getOperandBundlesAsDefs(OpBundles);
       Value *V = Builder.CreateCall(CF, OpVecs, OpBundles);
 
+      // for sandboxir
+      // if (auto *calli = dyn_cast<CallInst>(V)) 
+      //   Ctx.createCallInst(calli);
+      // else 
+      //   llvm_unreachable("Expected CallInst");
+      Ctx.registerCreatedValue(V);
+
       propagateIRFlags(V, E->Scalars, VL0);
       V = FinalShuffle(V, E);
 
@@ -20753,7 +21756,7 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
       Value *V;
       if (SLPReVec && !E->isAltShuffle()) {
         setInsertPointAfterBundle(E);
-        Value *Src = vectorizeOperand(E, 0);
+        Value *Src = SBvectorizeOperand(E, 0, Ctx);
         SmallVector<int> ThisMask(calculateShufflevectorMask(E->Scalars));
         if (auto *SVSrc = dyn_cast<ShuffleVectorInst>(Src)) {
           SmallVector<int> NewMask(ThisMask.size());
@@ -20762,8 +21765,24 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
           });
           V = Builder.CreateShuffleVector(SVSrc->getOperand(0),
                                           SVSrc->getOperand(1), NewMask);
+          // for sandboxir
+          // if (auto *svi = dyn_cast<ShuffleVectorInst>(V)) 
+          //   Ctx.createShuffleVectorInst(svi);
+          // else if (auto *c = dyn_cast<Constant>(V)) 
+          //   Ctx.getOrCreateConstant(c);
+          // else 
+          //   llvm_unreachable("Expected ShuffleVectorInst");
+          Ctx.registerCreatedValue(V);
         } else {
           V = Builder.CreateShuffleVector(Src, ThisMask);
+          // for sandboxir
+          // if (auto *svi = dyn_cast<ShuffleVectorInst>(V)) 
+          //   Ctx.createShuffleVectorInst(svi);
+          // else if (auto *c = dyn_cast<Constant>(V)) 
+          //   Ctx.getOrCreateConstant(c);
+          // else 
+          //   llvm_unreachable("Expected ShuffleVectorInst");
+          Ctx.registerCreatedValue(V);
         }
         propagateIRFlags(V, E->Scalars, VL0);
         if (auto *I = dyn_cast<Instruction>(V))
@@ -20781,11 +21800,11 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
         Value *LHS = nullptr, *RHS = nullptr;
         if (Instruction::isBinaryOp(E->getOpcode()) || isa<CmpInst>(VL0)) {
           setInsertPointAfterBundle(E);
-          LHS = vectorizeOperand(E, 0);
-          RHS = vectorizeOperand(E, 1);
+          LHS = SBvectorizeOperand(E, 0, Ctx);
+          RHS = SBvectorizeOperand(E, 1, Ctx);
         } else {
           setInsertPointAfterBundle(E);
-          LHS = vectorizeOperand(E, 0);
+          LHS = SBvectorizeOperand(E, 0, Ctx);
         }
         if (LHS && RHS &&
             ((Instruction::isBinaryOp(E->getOpcode()) &&
@@ -20808,31 +21827,80 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
             else
               CastTy = LHS->getType();
           }
-          if (LHS->getType() != CastTy)
+          if (LHS->getType() != CastTy) {
             LHS = Builder.CreateIntCast(LHS, CastTy, GetOperandSignedness(0));
-          if (RHS->getType() != CastTy)
+            // for sandboxir
+            // if (auto *sic = dyn_cast<CastInst>(LHS)) 
+            //   Ctx.createCastInst(sic);
+            // else if (auto *c = dyn_cast<Constant>(LHS)) 
+            //   Ctx.getOrCreateConstant(c);
+            Ctx.registerCreatedValue(LHS);
+          }
+          if (RHS->getType() != CastTy) {
             RHS = Builder.CreateIntCast(RHS, CastTy, GetOperandSignedness(1));
+            // for sandboxir
+            // if (auto *sic = dyn_cast<CastInst>(RHS)) 
+            //   Ctx.createCastInst(sic);
+            // else if (auto *c = dyn_cast<Constant>(RHS)) 
+            //   Ctx.getOrCreateConstant(c);
+            Ctx.registerCreatedValue(RHS);
+          }
         }
 
         Value *V0, *V1;
         if (Instruction::isBinaryOp(E->getOpcode())) {
           V0 = Builder.CreateBinOp(
               static_cast<Instruction::BinaryOps>(E->getOpcode()), LHS, RHS);
+          // for sandboxir
+          // if (auto *binopi = dyn_cast<BinaryOperator>(V0)) 
+          //   Ctx.createBinaryOperator(binopi);
+          // else if (auto *c = dyn_cast<Constant>(V0)) 
+          //   Ctx.getOrCreateConstant(c);
+          Ctx.registerCreatedValue(V0);
+
           V1 = Builder.CreateBinOp(
               static_cast<Instruction::BinaryOps>(E->getAltOpcode()), LHS, RHS);
+          // for sandboxir
+          // if (auto *binopi = dyn_cast<BinaryOperator>(V1)) 
+          //   Ctx.createBinaryOperator(binopi);
+          // else if (auto *c = dyn_cast<Constant>(V1)) 
+          //   Ctx.getOrCreateConstant(c);
+          Ctx.registerCreatedValue(V1);
+
         } else if (auto *CI0 = dyn_cast<CmpInst>(VL0)) {
           V0 = Builder.CreateCmp(CI0->getPredicate(), LHS, RHS);
+          // for sandboxir
+          // if (auto *icmpi = dyn_cast<ICmpInst>(V0)) {
+          //   Ctx.createICmpInst(icmpi);
+          // } else if (auto *fcmpi = dyn_cast<FCmpInst>(V0)) {
+          //   Ctx.createFCmpInst(fcmpi);
+          // }
+          Ctx.registerCreatedValue(V0);
           auto *AltCI = cast<CmpInst>(E->getAltOp());
           CmpInst::Predicate AltPred = AltCI->getPredicate();
           V1 = Builder.CreateCmp(AltPred, LHS, RHS);
+          // for sandboxir
+          // if (auto *icmpi = dyn_cast<ICmpInst>(V1)) {
+          //   Ctx.createICmpInst(icmpi);
+          // } else if (auto *fcmpi = dyn_cast<FCmpInst>(V1)) {
+          //   Ctx.createFCmpInst(fcmpi);
+          // }
+          Ctx.registerCreatedValue(V1);
         } else {
           if (LHS->getType()->isIntOrIntVectorTy() && ScalarTy->isIntegerTy()) {
             unsigned SrcBWSz = DL->getTypeSizeInBits(
                 cast<VectorType>(LHS->getType())->getElementType());
             unsigned BWSz = DL->getTypeSizeInBits(ScalarTy);
             if (BWSz <= SrcBWSz) {
-              if (BWSz < SrcBWSz)
+              if (BWSz < SrcBWSz) {
                 LHS = Builder.CreateIntCast(LHS, VecTy, It->second.first);
+                // for sandboxir
+                // if (auto *sic = dyn_cast<CastInst>(LHS)) 
+                //   Ctx.createCastInst(sic);
+                // else if (auto *c = dyn_cast<Constant>(LHS)) 
+                //   Ctx.getOrCreateConstant(c);
+                Ctx.registerCreatedValue(LHS);
+              }
               assert(LHS->getType() == VecTy &&
                      "Expected same type as operand.");
               if (auto *I = dyn_cast<Instruction>(LHS))
@@ -20845,8 +21913,21 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
           }
           V0 = Builder.CreateCast(
               static_cast<Instruction::CastOps>(E->getOpcode()), LHS, VecTy);
+          // for sandboxir
+          // if (auto *sic = dyn_cast<CastInst>(V0)) 
+          //   Ctx.createCastInst(sic);
+          // else if (auto *c = dyn_cast<Constant>(V0)) 
+          //   Ctx.getOrCreateConstant(c);
+          Ctx.registerCreatedValue(V0);
+
           V1 = Builder.CreateCast(
               static_cast<Instruction::CastOps>(E->getAltOpcode()), LHS, VecTy);
+          // for sandboxir
+          // if (auto *sic = dyn_cast<CastInst>(V1)) 
+          //   Ctx.createCastInst(sic);
+          // else if (auto *c = dyn_cast<Constant>(V1)) 
+          //   Ctx.getOrCreateConstant(c);
+          Ctx.registerCreatedValue(V1);
         }
         // Add V0 and V1 to later analysis to try to find and remove matching
         // instruction, if any.
@@ -20882,8 +21963,12 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
                   return false;
                 auto *IV = cast<Instruction>(V);
                 return IV->getOpcode() == Instruction::Sub && isCommutative(IV);
-              }))
-            I->setHasNoUnsignedWrap(/*b=*/false);
+              })) {
+                // I->setHasNoUnsignedWrap(/*b=*/false);
+                sandboxir::Instruction *sbi = dyn_cast<sandboxir::Instruction>(Ctx.getValue(I));
+                sbi->setHasNoUnsignedWrap(/*b=*/false);
+              }
+            
         };
         DropNuwFlag(V0, E->getOpcode());
         DropNuwFlag(V1, E->getAltOpcode());
@@ -20893,6 +21978,15 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
           transformScalarShuffleIndiciesToVector(VecTy->getNumElements(), Mask);
         }
         V = Builder.CreateShuffleVector(V0, V1, Mask);
+        // for sandboxir
+        // if (auto *svi = dyn_cast<ShuffleVectorInst>(V)) 
+        //   Ctx.createShuffleVectorInst(svi);
+        // else if (auto *c = dyn_cast<Constant>(V)) 
+        //   Ctx.getOrCreateConstant(c);
+        // else 
+        //   llvm_unreachable("Expected ShuffleVectorInst");
+        Ctx.registerCreatedValue(V);
+
         if (auto *I = dyn_cast<Instruction>(V)) {
           V = ::propagateMetadata(I, E->Scalars);
           GatherShuffleExtractSeq.insert(I);
@@ -21584,25 +22678,11 @@ Value *BoUpSLP::SBvectorizeTree(
     (void)getLastInstructionInBundle(TE.get());
   }
 
-  sandboxir::BasicBlock *SBInsertBB = nullptr; // may need to pass to further functions
-  sandboxir::BBIterator SBInsertPt; // may need to pass to further functions
-
-  if (ReductionRoot) {
-    if (UseSandboxIRForStores) {
-      SBInsertBB = cast_or_null<sandboxir::BasicBlock>(Ctx.getValue(ReductionRoot->getParent()));
-      SBInsertPt = cast_or_null<sandboxir::Instruction>(Ctx.getValue(ReductionRoot))->getIterator();
-    } else {
-      Builder.SetInsertPoint(ReductionRoot->getParent(),
-                             ReductionRoot->getIterator());
-    }
-  } else {
-    if (UseSandboxIRForStores) {
-      SBInsertBB = cast_or_null<sandboxir::BasicBlock>(Ctx.getValue(&F->getEntryBlock()));
-      SBInsertPt = SBInsertBB->begin();
-    } else {
-      Builder.SetInsertPoint(&F->getEntryBlock(), F->getEntryBlock().begin());
-    }
-  }
+  if (ReductionRoot)
+    Builder.SetInsertPoint(ReductionRoot->getParent(),
+                           ReductionRoot->getIterator());
+  else
+    Builder.SetInsertPoint(&F->getEntryBlock(), F->getEntryBlock().begin());
 
   // Emit gathered loads first to emit better code for the users of those
   // gathered loads.
@@ -21613,7 +22693,7 @@ Value *BoUpSLP::SBvectorizeTree(
       assert((TE->UserTreeIndex ||
               (TE->getOpcode() == Instruction::Load && !TE->isGather())) &&
              "Expected gathered load node.");
-      (void)SBvectorizeTree(TE.get(), Ctx);                   // 0505 here
+      (void)SBvectorizeTree(TE.get(), Ctx);
     }
   }
   (void)SBvectorizeTree(VectorizableTree[0].get(), Ctx);
@@ -21651,12 +22731,22 @@ Value *BoUpSLP::SBvectorizeTree(
       Builder.SetInsertPoint(PrevVec);
     }
     Builder.SetCurrentDebugLocation(UserI->getDebugLoc());
-    Value *Vec = SBvectorizeTree(TE, Ctx); // may need SBInsertBB, SBInsertPt
+    Value *Vec = SBvectorizeTree(TE, Ctx);
     if (auto *VecI = dyn_cast<Instruction>(Vec);
         VecI && VecI->getParent() == Builder.GetInsertBlock() &&
-        Builder.GetInsertPoint()->comesBefore(VecI))
-      VecI->moveBeforePreserving(*Builder.GetInsertBlock(),
-                                 Builder.GetInsertPoint());
+        Builder.GetInsertPoint()->comesBefore(VecI)) {
+      // VecI->moveBeforePreserving(*Builder.GetInsertBlock(),
+      //                        Builder.GetInsertPoint());
+      // Notice: we don't consider preserving for now.
+      sandboxir::BasicBlock *sbb = 
+        dyn_cast<sandboxir::BasicBlock>(Ctx.getValue(Builder.GetInsertBlock()));
+      sandboxir::BBIterator SBWhereIt(Builder.GetInsertBlock(), Builder.GetInsertPoint(), &Ctx);
+      sandboxir::Instruction *sVecI = 
+        dyn_cast<sandboxir::Instruction>(Ctx.getValue(VecI));
+      assert(sVecI && sbb && "Failed to get SandboxIR Value for vectorized instruction or its block");
+      sVecI->moveBefore(*sbb, SBWhereIt);
+    }
+      
     if (Vec->getType() != PrevVec->getType()) {
       assert(Vec->getType()->isIntOrIntVectorTy() &&
              PrevVec->getType()->isIntOrIntVectorTy() &&
@@ -21704,8 +22794,17 @@ Value *BoUpSLP::SBvectorizeTree(
       assert(IsSigned &&
              "Expected user node or perfect diamond match in MinBWs.");
       Vec = Builder.CreateIntCast(Vec, PrevVec->getType(), *IsSigned);
+      // for sandboxir
+      // if (auto *sic = dyn_cast<CastInst>(Vec)) 
+      //   Ctx.createCastInst(sic);
+      // else if (auto *c = dyn_cast<Constant>(Vec)) 
+      //   Ctx.getOrCreateConstant(c);
+      Ctx.registerCreatedValue(Vec);
     }
-    PrevVec->replaceAllUsesWith(Vec);
+    // PrevVec->replaceAllUsesWith(Vec);
+    sandboxir::Value *SBPrevVec = Ctx.getValue(PrevVec);
+    SBPrevVec->replaceAllUsesWith(Ctx.getValue(Vec));
+
     PostponedValues.try_emplace(Vec).first->second.push_back(TE);
     // Replace the stub vector node, if it was used before for one of the
     // buildvector nodes already.
@@ -21714,6 +22813,10 @@ Value *BoUpSLP::SBvectorizeTree(
       for (TreeEntry *VTE : It->getSecond())
         VTE->VectorizedValue = Vec;
     }
+    // if (sandboxir::Instruction *SBEI = dyn_cast<sandboxir::Instruction>(Ctx.getValue(PrevVec))) {
+    //     SBEI->eraseFromParent();        
+    //   }
+    // we don't do anything to erase for now.
     eraseInstruction(PrevVec);
   }
 
@@ -21770,10 +22873,23 @@ Value *BoUpSLP::SBvectorizeTree(
                 I && !ReplaceInst &&
                 Builder.GetInsertPoint() != Builder.GetInsertBlock()->end() &&
                 Builder.GetInsertPoint()->comesBefore(I)) {
-              I->moveBefore(*Builder.GetInsertPoint()->getParent(),
-                            Builder.GetInsertPoint());
-              if (auto *CI = dyn_cast<Instruction>(EEIt->second.second))
-                CI->moveAfter(I);
+              // I->moveBefore(*Builder.GetInsertPoint()->getParent(),
+              //               Builder.GetInsertPoint());
+              sandboxir::BasicBlock *sbb = 
+                dyn_cast<sandboxir::BasicBlock>(Ctx.getValue(Builder.GetInsertPoint()->getParent()));
+              sandboxir::BBIterator SBWhereIt(Builder.GetInsertBlock(), Builder.GetInsertPoint(), &Ctx);
+              sandboxir::Instruction *sI = 
+                dyn_cast<sandboxir::Instruction>(Ctx.getValue(I));
+              assert(sI && sbb && "Failed to get SandboxIR Value for instruction or its block!");
+              sI->moveBefore(*sbb, SBWhereIt);
+              
+              if (auto *CI = dyn_cast<Instruction>(EEIt->second.second)) {
+                // CI->moveAfter(I);
+                sandboxir::Instruction *sCI = 
+                  dyn_cast<sandboxir::Instruction>(Ctx.getValue(CI));
+                sCI->moveAfter(sI);
+              }
+                
             }
             Ex = PrevV;
             ExV = EEIt->second.second ? EEIt->second.second : Ex;
@@ -21792,7 +22908,150 @@ Value *BoUpSLP::SBvectorizeTree(
               CloneInst->insertBefore(Inst->getIterator());
               if (Inst->hasName())
                 CloneInst->takeName(Inst);
+              // for sandboxir
+              sandboxir::Instruction *SBCloneInst = 
+                dyn_cast<sandboxir::Instruction>(Ctx.registerCreatedValue(CloneInst));
               Ex = CloneInst;
+              // switch (CloneInst->getOpcode()) {
+              //   case llvm::Instruction::VAArg:
+              //       SBCloneInst = Ctx.createVAArgInst(cast<llvm::VAArgInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::Freeze:
+              //       SBCloneInst = Ctx.createFreezeInst(cast<llvm::FreezeInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::Fence:
+              //       SBCloneInst = Ctx.createFenceInst(cast<llvm::FenceInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::Select:
+              //       SBCloneInst = Ctx.createSelectInst(cast<llvm::SelectInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::ExtractElement:
+              //       SBCloneInst = Ctx.createExtractElementInst(cast<llvm::ExtractElementInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::InsertElement:
+              //       SBCloneInst = Ctx.createInsertElementInst(cast<llvm::InsertElementInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::ShuffleVector:
+              //       SBCloneInst = Ctx.createShuffleVectorInst(cast<llvm::ShuffleVectorInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::ExtractValue:
+              //       SBCloneInst = Ctx.createExtractValueInst(cast<llvm::ExtractValueInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::InsertValue:
+              //       SBCloneInst = Ctx.createInsertValueInst(cast<llvm::InsertValueInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::Br:
+              //       SBCloneInst = Ctx.createBranchInst(cast<llvm::BranchInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::Load:
+              //       SBCloneInst = Ctx.createLoadInst(cast<llvm::LoadInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::Store:
+              //       SBCloneInst = Ctx.createStoreInst(cast<llvm::StoreInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::Ret:
+              //       SBCloneInst = Ctx.createReturnInst(cast<llvm::ReturnInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::Call:
+              //       SBCloneInst = Ctx.createCallInst(cast<llvm::CallInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::Invoke:
+              //       SBCloneInst = Ctx.createInvokeInst(cast<llvm::InvokeInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::CallBr:
+              //       SBCloneInst = Ctx.createCallBrInst(cast<llvm::CallBrInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::LandingPad:
+              //       SBCloneInst = Ctx.createLandingPadInst(cast<llvm::LandingPadInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::CatchPad:
+              //       SBCloneInst = Ctx.createCatchPadInst(cast<llvm::CatchPadInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::CleanupPad:
+              //       SBCloneInst = Ctx.createCleanupPadInst(cast<llvm::CleanupPadInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::CatchRet:
+              //       SBCloneInst = Ctx.createCatchReturnInst(cast<llvm::CatchReturnInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::CleanupRet:
+              //       SBCloneInst = Ctx.createCleanupReturnInst(cast<llvm::CleanupReturnInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::GetElementPtr:
+              //       SBCloneInst = Ctx.createGetElementPtrInst(cast<llvm::GetElementPtrInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::CatchSwitch:
+              //       SBCloneInst = Ctx.createCatchSwitchInst(cast<llvm::CatchSwitchInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::Resume:
+              //       SBCloneInst = Ctx.createResumeInst(cast<llvm::ResumeInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::Switch:
+              //       SBCloneInst = Ctx.createSwitchInst(cast<llvm::SwitchInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::FNeg: // UnaryOperator
+              //       SBCloneInst = Ctx.createUnaryOperator(cast<llvm::UnaryOperator>(CloneInst));
+              //       break;  
+              //   case llvm::Instruction::Add: // BinaryOperators start here
+              //   case llvm::Instruction::FAdd:
+              //   case llvm::Instruction::Sub:
+              //   case llvm::Instruction::FSub:
+              //   case llvm::Instruction::Mul:
+              //   case llvm::Instruction::FMul:
+              //   case llvm::Instruction::UDiv:
+              //   case llvm::Instruction::SDiv:
+              //   case llvm::Instruction::FDiv:
+              //   case llvm::Instruction::URem:
+              //   case llvm::Instruction::SRem:
+              //   case llvm::Instruction::FRem:
+              //   case llvm::Instruction::Shl:
+              //   case llvm::Instruction::LShr:
+              //   case llvm::Instruction::AShr:
+              //   case llvm::Instruction::And:
+              //   case llvm::Instruction::Or:
+              //   case llvm::Instruction::Xor:
+              //       SBCloneInst = Ctx.createBinaryOperator(cast<llvm::BinaryOperator>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::AtomicRMW:
+              //       SBCloneInst = Ctx.createAtomicRMWInst(cast<llvm::AtomicRMWInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::AtomicCmpXchg:
+              //       SBCloneInst = Ctx.createAtomicCmpXchgInst(cast<llvm::AtomicCmpXchgInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::Alloca:
+              //       SBCloneInst = Ctx.createAllocaInst(cast<llvm::AllocaInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::ZExt: // CastInsts start here
+              //   case llvm::Instruction::SExt:
+              //   case llvm::Instruction::FPToUI:
+              //   case llvm::Instruction::FPToSI:
+              //   case llvm::Instruction::FPExt:
+              //   case llvm::Instruction::PtrToInt:
+              //   case llvm::Instruction::IntToPtr:
+              //   case llvm::Instruction::SIToFP:
+              //   case llvm::Instruction::UIToFP:
+              //   case llvm::Instruction::Trunc:
+              //   case llvm::Instruction::FPTrunc:
+              //   case llvm::Instruction::BitCast:
+              //   case llvm::Instruction::AddrSpaceCast:
+              //       SBCloneInst = Ctx.createCastInst(cast<llvm::CastInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::PHI:
+              //       SBCloneInst = Ctx.createPHINode(cast<llvm::PHINode>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::ICmp:
+              //       SBCloneInst = Ctx.createICmpInst(cast<llvm::ICmpInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::FCmp:
+              //       SBCloneInst = Ctx.createFCmpInst(cast<llvm::FCmpInst>(CloneInst));
+              //       break;
+              //   case llvm::Instruction::Unreachable:
+              //       SBCloneInst = Ctx.createUnreachableInst(cast<llvm::UnreachableInst>(CloneInst));
+              //       break;
+              //   default:
+              //       LLVM_DEBUG(dbgs() << "@@ We don't want to get here.\n");
+              //       break;
+              // }
+              
             }
           } else if (auto *ES = dyn_cast<ExtractElementInst>(Scalar);
                      ES && isa<Instruction>(Vec)) {
@@ -21802,10 +23061,27 @@ Value *BoUpSLP::SBvectorizeTree(
               V = ETEs.front()->VectorizedValue;
             if (auto *IV = dyn_cast<Instruction>(V);
                 !IV || IV == Vec || IV->getParent() != IVec->getParent() ||
-                IV->comesBefore(IVec))
-              Ex = Builder.CreateExtractElement(V, ES->getIndexOperand());
-            else
+                IV->comesBefore(IVec)) {
+                  Ex = Builder.CreateExtractElement(V, ES->getIndexOperand());
+              // for sandboxir
+              // if (auto *svi = dyn_cast<ExtractElementInst>(Ex)) 
+              //   Ctx.createExtractElementInst(svi);
+              // else if (auto *c = dyn_cast<Constant>(Ex)) 
+              //   Ctx.getOrCreateConstant(c);
+              // else 
+              //   llvm_unreachable("Unhandled Vec type!");
+              Ctx.registerCreatedValue(Ex);
+            } else {
               Ex = Builder.CreateExtractElement(Vec, Lane);
+              // for sandboxir
+              // if (auto *svi = dyn_cast<ExtractElementInst>(Ex)) 
+              //   Ctx.createExtractElementInst(svi);
+              // else if (auto *c = dyn_cast<Constant>(Ex)) 
+              //   Ctx.getOrCreateConstant(c);
+              // else 
+              //   llvm_unreachable("Unhandled Vec type!");
+              Ctx.registerCreatedValue(Ex);
+            }
           } else if (auto *VecTy =
                          dyn_cast<FixedVectorType>(Scalar->getType())) {
             assert(SLPReVec && "FixedVectorType is not expected.");
@@ -21813,18 +23089,34 @@ Value *BoUpSLP::SBvectorizeTree(
             // When REVEC is enabled, we need to extract a vector.
             // Note: The element size of Scalar may be different from the
             // element size of Vec.
-            Ex = createExtractVector(Builder, Vec, VecTyNumElements,
-                                     ExternalUse.Lane * VecTyNumElements);
+            Ex = SBcreateExtractVector(Builder, Vec, VecTyNumElements,
+                                     ExternalUse.Lane * VecTyNumElements, Ctx);
           } else {
             Ex = Builder.CreateExtractElement(Vec, Lane);
+            // for sandboxir
+            // if (auto *svi = dyn_cast<ExtractElementInst>(Ex)) 
+            //   Ctx.createExtractElementInst(svi);
+            // else if (auto *c = dyn_cast<Constant>(Ex)) 
+            //   Ctx.getOrCreateConstant(c);
+            // else 
+            //   llvm_unreachable("Unhandled Vec type!");
+            Ctx.registerCreatedValue(Ex);
           }
           // If necessary, sign-extend or zero-extend ScalarRoot
           // to the larger type.
           ExV = Ex;
-          if (Scalar->getType() != Ex->getType())
+          if (Scalar->getType() != Ex->getType()) {
             ExV = Builder.CreateIntCast(
                 Ex, Scalar->getType(),
                 !isKnownNonNegative(Scalar, SimplifyQuery(*DL)));
+            // for sandboxir
+            // if (auto *sic = dyn_cast<CastInst>(ExV)) 
+            //   Ctx.createCastInst(sic);
+            // else if (auto *c = dyn_cast<Constant>(ExV)) 
+            //   Ctx.getOrCreateConstant(c);
+            Ctx.registerCreatedValue(ExV);
+          }
+            
           auto *I = dyn_cast<Instruction>(Ex);
           ScalarToEEs[Scalar].try_emplace(I ? I->getParent()
                                             : &F->getEntryBlock(),
@@ -21903,7 +23195,9 @@ Value *BoUpSLP::SBvectorizeTree(
         assert((!isa<ExtractElementInst>(Scalar) ||
                 !IgnoredExtracts.contains(cast<ExtractElementInst>(Scalar))) &&
                "Extractelements should not be replaced.");
-        Scalar->replaceAllUsesWith(NewInst);
+        // Scalar->replaceAllUsesWith(NewInst);
+        sandboxir::Value *SBPrevVec = Ctx.getValue(Scalar);
+        SBPrevVec->replaceAllUsesWith(Ctx.getValue(NewInst));
       }
       continue;
     }
@@ -21941,6 +23235,12 @@ Value *BoUpSLP::SBvectorizeTree(
                       ScalarTy,
                       cast<FixedVectorType>(Vec->getType())->getNumElements()),
                   BWIt->second.second);
+              // for sandboxir
+              // if (auto *sic = dyn_cast<CastInst>(Vec)) 
+              //   Ctx.createCastInst(sic);
+              // else if (auto *c = dyn_cast<Constant>(Vec)) 
+              //   Ctx.getOrCreateConstant(c);
+              Ctx.registerCreatedValue(Vec);
               VectorCasts.try_emplace(Key, Vec);
             } else {
               Vec = VecIt->second;
@@ -21989,18 +23289,32 @@ Value *BoUpSLP::SBvectorizeTree(
               Builder.SetInsertPoint(PH->getIncomingBlock(I)->getTerminator());
             }
             Value *NewInst = ExtractAndExtendIfNeeded(Vec);
-            PH->setOperand(I, NewInst);
+            // PH->setOperand(I, NewInst);
+            sandboxir::Value *SBPH = Ctx.getValue(dyn_cast<Value>(PH));
+            sandboxir::Value *SBNewInst = Ctx.getValue(NewInst);
+            sandboxir::PHINode *SBP = dyn_cast<sandboxir::PHINode>(SBPH);
+            SBP->setIncomingValue(I, SBNewInst);
           }
         }
       } else {
         Builder.SetInsertPoint(cast<Instruction>(User));
         Value *NewInst = ExtractAndExtendIfNeeded(Vec);
-        User->replaceUsesOfWith(Scalar, NewInst);
+        // User->replaceUsesOfWith(Scalar, NewInst);
+        // for sandboxir
+        sandboxir::Value *SBUser = Ctx.getValue(dyn_cast<Value>(User));
+        sandboxir::Value *SBNewInst = Ctx.getValue(NewInst);
+        sandboxir::Value *SBScalar = Ctx.getValue(Scalar);
+        cast<sandboxir::User>(SBUser)->replaceUsesOfWith(SBScalar, SBNewInst);
       }
     } else {
       Builder.SetInsertPoint(&F->getEntryBlock(), F->getEntryBlock().begin());
       Value *NewInst = ExtractAndExtendIfNeeded(Vec);
-      User->replaceUsesOfWith(Scalar, NewInst);
+      // User->replaceUsesOfWith(Scalar, NewInst);
+      // for sandboxir
+      sandboxir::Value *SBUser = Ctx.getValue(dyn_cast<Value>(User));
+      sandboxir::Value *SBNewInst = Ctx.getValue(NewInst);
+      sandboxir::Value *SBScalar = Ctx.getValue(Scalar);
+      cast<sandboxir::User>(SBUser)->replaceUsesOfWith(SBScalar, SBNewInst);
     }
 
     LLVM_DEBUG(dbgs() << "SLP: Replaced:" << *User << ".\n");
@@ -22016,8 +23330,8 @@ Value *BoUpSLP::SBvectorizeTree(
       else
         CombinedMask2[I] = Mask[I] - VF;
     }
-    ShuffleInstructionBuilder ShuffleBuilder(
-        cast<VectorType>(V1->getType())->getElementType(), Builder, *this);
+    SBShuffleInstructionBuilder ShuffleBuilder(
+        cast<VectorType>(V1->getType())->getElementType(), Ctx, Builder, *this);
     ShuffleBuilder.add(V1, CombinedMask1);
     if (V2)
       ShuffleBuilder.add(V2, CombinedMask2);
@@ -22095,18 +23409,34 @@ Value *BoUpSLP::SBvectorizeTree(
       II = dyn_cast<InsertElementInst>(II->getOperand(0));
     }
     for (Instruction *II : reverse(Inserts)) {
-      II->replaceUsesOfWith(II->getOperand(0), NewInst);
+      // II->replaceUsesOfWith(II->getOperand(0), NewInst);
+      sandboxir::Value *SBII = Ctx.getValue(dyn_cast<Value>(II));
+      sandboxir::Value *SBNewInst = Ctx.getValue(NewInst);
+      sandboxir::Value *SBOp0 = Ctx.getValue(II->getOperand(0));
+      cast<sandboxir::User>(SBII)->replaceUsesOfWith(SBOp0, SBNewInst);
       if (auto *NewI = dyn_cast<Instruction>(NewInst))
-        if (II->getParent() == NewI->getParent() && II->comesBefore(NewI))
-          II->moveAfter(NewI);
+        if (II->getParent() == NewI->getParent() && II->comesBefore(NewI)) {
+          // II->moveAfter(NewI);
+          sandboxir::Instruction *SBII = dyn_cast<sandboxir::Instruction>(Ctx.getValue(II));
+          sandboxir::Instruction *SBNewI = dyn_cast<sandboxir::Instruction>(Ctx.getValue(NewI));
+          SBII->moveAfter(SBNewI);
+        }
+          
       NewInst = II;
     }
-    LastInsert->replaceAllUsesWith(NewInst);
+    // LastInsert->replaceAllUsesWith(NewInst);
+    sandboxir::Value *SBLastInsert = Ctx.getValue(LastInsert);
+    SBLastInsert->replaceAllUsesWith(Ctx.getValue(NewInst));
     for (InsertElementInst *IE : reverse(ShuffledInserts[I].InsertElements)) {
-      IE->replaceUsesOfWith(IE->getOperand(0),
-                            PoisonValue::get(IE->getOperand(0)->getType()));
-      IE->replaceUsesOfWith(IE->getOperand(1),
-                            PoisonValue::get(IE->getOperand(1)->getType()));
+      // IE->replaceUsesOfWith(IE->getOperand(0),
+      //                       PoisonValue::get(IE->getOperand(0)->getType()));
+      // IE->replaceUsesOfWith(IE->getOperand(1),
+      //                       PoisonValue::get(IE->getOperand(1)->getType()));
+      sandboxir::Value *SBIE = Ctx.getValue(dyn_cast<Value>(IE));
+      sandboxir::Value *SBOp0 = Ctx.getValue(IE->getOperand(0));
+      sandboxir::Value *SBOp1 = Ctx.getValue(IE->getOperand(1));
+      cast<sandboxir::User>(SBIE)->replaceUsesOfWith(SBOp0, sandboxir::PoisonValue::get(SBOp0->getType()));
+      cast<sandboxir::User>(SBIE)->replaceUsesOfWith(SBOp1, sandboxir::PoisonValue::get(SBOp1->getType()));
       eraseInstruction(IE);
     }
     CSEBlocks.insert(LastInsert->getParent());
@@ -22158,12 +23488,17 @@ Value *BoUpSLP::SBvectorizeTree(
 
   // Merge the DIAssignIDs from the about-to-be-deleted instructions into the
   // new vector instruction.
-  if (auto *V = dyn_cast<Instruction>(VectorizableTree[0]->VectorizedValue))
-    V->mergeDIAssignID(RemovedInsts);
-
+  if (auto *V = dyn_cast<Instruction>(VectorizableTree[0]->VectorizedValue)) {
+    if (!UseSandboxIRForStores)           // Skip mergeDIAssignID() in sandbox ir mode for now.
+      V->mergeDIAssignID(RemovedInsts);
+  }
+    
+  // LLVM_DEBUG(dbgs() << "@@SLP1 "<< ".\n");
   // Clear up reduction references, if any.
   if (UserIgnoreList) {
+    // LLVM_DEBUG(dbgs() << "@@SLP2 "<< ".\n");
     for (Instruction *I : RemovedInsts) {
+      // LLVM_DEBUG(dbgs() << "@@SLP3 "<< ".\n");
       const TreeEntry *IE = getTreeEntries(I).front();
       if (IE->Idx != 0 &&
           !(VectorizableTree.front()->isGather() && IE->UserTreeIndex &&
@@ -22180,30 +23515,58 @@ Value *BoUpSLP::SBvectorizeTree(
             is_contained(VectorizableTree.front()->Scalars, I)))
         continue;
       SmallVector<SelectInst *> LogicalOpSelects;
-      I->replaceUsesWithIf(PoisonValue::get(I->getType()), [&](Use &U) {
+      // I->replaceUsesWithIf(PoisonValue::get(I->getType()), [&](Use &U) {
+      //   // Do not replace condition of the logical op in form select <cond>.
+      //   bool IsPoisoningLogicalOp = isa<SelectInst>(U.getUser()) &&
+      //                               (match(U.getUser(), m_LogicalAnd()) ||
+      //                                match(U.getUser(), m_LogicalOr())) &&
+      //                               U.getOperandNo() == 0;
+      //   if (IsPoisoningLogicalOp) {
+      //     LogicalOpSelects.push_back(cast<SelectInst>(U.getUser()));
+      //     return false;
+      //   }
+      //   return UserIgnoreList->contains(U.getUser());
+      // });
+      // sandbox ir version
+      auto *SBI = cast<sandboxir::Instruction>(Ctx.getValue(I));
+      auto *SBPoison = sandboxir::PoisonValue::get(SBI->getType());
+      SBI->replaceUsesWithIf(SBPoison, [&](const sandboxir::Use &U) {
         // Do not replace condition of the logical op in form select <cond>.
-        bool IsPoisoningLogicalOp = isa<SelectInst>(U.getUser()) &&
-                                    (match(U.getUser(), m_LogicalAnd()) ||
-                                     match(U.getUser(), m_LogicalOr())) &&
+        sandboxir::User *SBUser = U.getUser();
+        bool IsPoisoningLogicalOp = isa<sandboxir::SelectInst>(SBUser) &&
+                                    (match(SBUser->getLLVMValue(), m_LogicalAnd()) ||
+                                     match(SBUser->getLLVMValue(), m_LogicalOr())) &&
                                     U.getOperandNo() == 0;
         if (IsPoisoningLogicalOp) {
-          LogicalOpSelects.push_back(cast<SelectInst>(U.getUser()));
+          LogicalOpSelects.push_back(cast<SelectInst>(SBUser->getLLVMValue()));
           return false;
         }
-        return UserIgnoreList->contains(U.getUser());
+        return UserIgnoreList->contains(cast<llvm::User>(SBUser->getLLVMValue()));
       });
       // Replace conditions of the poisoning logical ops with the non-poison
       // constant value.
-      for (SelectInst *SI : LogicalOpSelects)
-        SI->setCondition(Constant::getNullValue(SI->getCondition()->getType()));
+      for (SelectInst *SI : LogicalOpSelects) {
+        // SI->setCondition(Constant::getNullValue(SI->getCondition()->getType()));
+        auto *SBSI = dyn_cast_or_null<sandboxir::SelectInst>(Ctx.getValue(SI));
+        if (!SBSI) {
+          LLVM_DEBUG(dbgs() << "@@SLP: \tNot a select instruction:" << *SI << ".\n");
+          continue;
+        }
+        Constant *NullValueLLVM =
+            Constant::getNullValue(SI->getCondition()->getType());
+        // sandboxir::Value *NullValueSB = Ctx.getOrCreateConstant(NullValueLLVM);
+        sandboxir::Value *NullValueSB = Ctx.registerCreatedValue(NullValueLLVM);
+        SBSI->setCondition(NullValueSB);
+      }
     }
   }
   // Retain to-be-deleted instructions for some debug-info bookkeeping and alias
   // cache correctness.
   // NOTE: removeInstructionAndOperands only marks the instruction for deletion
   // - instructions are not deleted until later.
-  removeInstructionsAndOperands(ArrayRef(RemovedInsts), VectorValuesAndScales);
-
+  LLVM_DEBUG(dbgs() << "@@SLP1 "<< ".\n");
+  SBremoveInstructionsAndOperands(Ctx, ArrayRef(RemovedInsts), VectorValuesAndScales);
+  LLVM_DEBUG(dbgs() << "@@SLP2 "<< ".\n");
   Builder.ClearInsertionPoint();
   InstrElementSize.clear();
 
@@ -22220,6 +23583,12 @@ Value *BoUpSLP::SBvectorizeTree(
         VectorType::get(Builder.getIntNTy(ReductionBitWidth),
                         cast<VectorType>(Vec->getType())->getElementCount()),
         It->second.second);
+    // for sandboxir
+    // if (auto *sic = dyn_cast<CastInst>(Vec)) 
+    //   Ctx.createCastInst(sic);
+    // else if (auto *c = dyn_cast<Constant>(Vec)) 
+    //   Ctx.getOrCreateConstant(c);
+    Ctx.registerCreatedValue(Vec);
   }
   return Vec;
 }
@@ -23842,8 +25211,9 @@ bool SLPVectorizerPass::runImpl(Function &F, ScalarEvolution *SE_,
   DL = &F.getDataLayout();
 
   sandboxir::Context Ctx(F.getContext());
-  // auto *SBF = Ctx.createFunction(&F);
-
+  auto *SBF = Ctx.createFunction(&F);
+  // Ctx.dumpMap();
+  
   Stores.clear();
   GEPs.clear();
   bool Changed = false;

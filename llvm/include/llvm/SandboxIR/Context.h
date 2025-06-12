@@ -270,6 +270,18 @@ public:
   /// Create a sandboxir::Module corresponding to \p LLVMM.
   Module *createModule(llvm::Module *LLVMM);
 
+  /// Register an existing LLVM IR \p I and create the corresponding
+  /// sandboxir::Instruction wrapper.
+  /// This is the main API for registering instructions created outside of
+  /// SandboxIR's own builders. The creation will be tracked.
+  /// Create by myself
+  Instruction *registerInstruction(llvm::Instruction *I);
+
+  /// Register a Value that was just created by an external builder.
+  /// This handles cases where the creation might have been constant-folded,
+  /// resulting in a Constant instead of an Instruction.
+  Value *registerCreatedValue(llvm::Value *V);
+
   /// \Returns the number of values registered with Context.
   size_t getNumValues() const { return LLVMValueToValueMap.size(); }
 
@@ -297,6 +309,8 @@ public:
   /// \Returns a callback ID for later deregistration.
   CallbackID registerSetUseCallback(SetUseCallback CB);
   void unregisterSetUseCallback(CallbackID ID);
+
+  void dumpMap();
 };
 
 } // namespace sandboxir

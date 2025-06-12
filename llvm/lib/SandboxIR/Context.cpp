@@ -777,4 +777,154 @@ void Context::unregisterSetUseCallback(CallbackID ID) {
          "Callback ID not found in SetUseCallbacks during deregistration");
 }
 
+/// Register an existing LLVM IR for sandboxir
+/// Note: This is the main API for registering instructions created outside of
+/// SandboxIR's own builders. The creation will be tracked.
+/// Create by myself
+Instruction *Context::registerInstruction(llvm::Instruction *I) {
+  // assert(getValue(I) == nullptr && "Instruction already registered!");
+  if (getValue(I) != nullptr) return cast<Instruction>(getValue(I));
+
+  switch (I->getOpcode()) {
+  case llvm::Instruction::VAArg:
+    return createVAArgInst(cast<llvm::VAArgInst>(I));
+  case llvm::Instruction::Freeze:
+    return createFreezeInst(cast<llvm::FreezeInst>(I));
+  case llvm::Instruction::Fence:
+    return createFenceInst(cast<llvm::FenceInst>(I));
+  case llvm::Instruction::Select:
+    return createSelectInst(cast<llvm::SelectInst>(I));
+  case llvm::Instruction::ExtractElement:
+    return createExtractElementInst(cast<llvm::ExtractElementInst>(I));
+  case llvm::Instruction::InsertElement:
+    return createInsertElementInst(cast<llvm::InsertElementInst>(I));
+  case llvm::Instruction::ShuffleVector:
+    return createShuffleVectorInst(cast<llvm::ShuffleVectorInst>(I));
+  case llvm::Instruction::ExtractValue:
+    return createExtractValueInst(cast<llvm::ExtractValueInst>(I));
+  case llvm::Instruction::InsertValue:
+    return createInsertValueInst(cast<llvm::InsertValueInst>(I));
+  case llvm::Instruction::Br:
+    return createBranchInst(cast<llvm::BranchInst>(I));
+  case llvm::Instruction::Load:
+    return createLoadInst(cast<llvm::LoadInst>(I));
+  case llvm::Instruction::Store:
+    return createStoreInst(cast<llvm::StoreInst>(I));
+  case llvm::Instruction::Ret:
+    return createReturnInst(cast<llvm::ReturnInst>(I));
+  case llvm::Instruction::Call:
+    return createCallInst(cast<llvm::CallInst>(I));
+  case llvm::Instruction::Invoke:
+    return createInvokeInst(cast<llvm::InvokeInst>(I));
+  case llvm::Instruction::CallBr:
+    return createCallBrInst(cast<llvm::CallBrInst>(I));
+  case llvm::Instruction::LandingPad:
+    return createLandingPadInst(cast<llvm::LandingPadInst>(I));
+  case llvm::Instruction::CatchPad:
+    return createCatchPadInst(cast<llvm::CatchPadInst>(I));
+  case llvm::Instruction::CleanupPad:
+    return createCleanupPadInst(cast<llvm::CleanupPadInst>(I));
+  case llvm::Instruction::CatchRet:
+    return createCatchReturnInst(cast<llvm::CatchReturnInst>(I));
+  case llvm::Instruction::CleanupRet:
+    return createCleanupReturnInst(cast<llvm::CleanupReturnInst>(I));
+  case llvm::Instruction::GetElementPtr:
+    return createGetElementPtrInst(cast<llvm::GetElementPtrInst>(I));
+  case llvm::Instruction::CatchSwitch:
+    return createCatchSwitchInst(cast<llvm::CatchSwitchInst>(I));
+  case llvm::Instruction::Resume:
+    return createResumeInst(cast<llvm::ResumeInst>(I));
+  case llvm::Instruction::Switch:
+    return createSwitchInst(cast<llvm::SwitchInst>(I));
+  case llvm::Instruction::FNeg:
+    return createUnaryOperator(cast<llvm::UnaryOperator>(I));
+  case llvm::Instruction::Add:
+  case llvm::Instruction::FAdd:
+  case llvm::Instruction::Sub:
+  case llvm::Instruction::FSub:
+  case llvm::Instruction::Mul:
+  case llvm::Instruction::FMul:
+  case llvm::Instruction::UDiv:
+  case llvm::Instruction::SDiv:
+  case llvm::Instruction::FDiv:
+  case llvm::Instruction::URem:
+  case llvm::Instruction::SRem:
+  case llvm::Instruction::FRem:
+  case llvm::Instruction::Shl:
+  case llvm::Instruction::LShr:
+  case llvm::Instruction::AShr:
+  case llvm::Instruction::And:
+  case llvm::Instruction::Or:
+  case llvm::Instruction::Xor:
+    return createBinaryOperator(cast<llvm::BinaryOperator>(I));
+  case llvm::Instruction::AtomicRMW:
+    return createAtomicRMWInst(cast<llvm::AtomicRMWInst>(I));
+  case llvm::Instruction::AtomicCmpXchg:
+    return createAtomicCmpXchgInst(cast<llvm::AtomicCmpXchgInst>(I));
+  case llvm::Instruction::Alloca:
+    return createAllocaInst(cast<llvm::AllocaInst>(I));
+  case llvm::Instruction::ZExt:
+  case llvm::Instruction::SExt:
+  case llvm::Instruction::FPToUI:
+  case llvm::Instruction::FPToSI:
+  case llvm::Instruction::FPExt:
+  case llvm::Instruction::PtrToInt:
+  case llvm::Instruction::IntToPtr:
+  case llvm::Instruction::SIToFP:
+  case llvm::Instruction::UIToFP:
+  case llvm::Instruction::Trunc:
+  case llvm::Instruction::FPTrunc:
+  case llvm::Instruction::BitCast:
+  case llvm::Instruction::AddrSpaceCast:
+    return createCastInst(cast<llvm::CastInst>(I));
+  case llvm::Instruction::PHI:
+    return createPHINode(cast<llvm::PHINode>(I));
+  case llvm::Instruction::ICmp:
+    return createICmpInst(cast<llvm::ICmpInst>(I));
+  case llvm::Instruction::FCmp:
+    return createFCmpInst(cast<llvm::FCmpInst>(I));
+  case llvm::Instruction::Unreachable:
+    return createUnreachableInst(cast<llvm::UnreachableInst>(I));
+  default:
+    break;
+  }
+  // Fallback for unhandled instructions.
+  auto NewPtr =
+      std::unique_ptr<OpaqueInst>(new OpaqueInst(I, *this));
+  return cast<OpaqueInst>(registerValue(std::move(NewPtr)));
+}
+
+Value *Context::registerCreatedValue(llvm::Value *V) {
+  // First, check if V is an instruction.
+  if (auto *I = dyn_cast<llvm::Instruction>(V)) {
+    // If so, call registerInstruction to ensure its creation is tracked.
+    return registerInstruction(I);
+  }
+  // If not, check if it's a constant (due to constant folding).
+  if (auto *C = dyn_cast<llvm::Constant>(V)) {
+    // If so, get or create the wrapper for the constant.
+    return getOrCreateConstant(C);
+  }
+  // If the value is neither an instruction nor a constant, it's an
+  // unexpected type resulting from an instruction-creation-like call.
+  llvm_unreachable(
+      "Unhandled value type in registerCreatedValue. Expected "
+      "Instruction or Constant.");
+  return nullptr;
+}
+
+void Context::dumpMap() {
+  dbgs() << "--- Dumping sandboxir::Context LLVMValueToValueMap ---\n";
+  dbgs() << "Map size: " << LLVMValueToValueMap.size() << "\n";
+  if (LLVMValueToValueMap.empty()) {
+    dbgs() << "(Map is empty)\n";
+  } else {
+    for (const auto &Pair : LLVMValueToValueMap) {
+      dbgs() << "  LLVM*:" << Pair.first << " -> SB*:" << Pair.second.get()
+             << " (Name: " << Pair.first->getName() << ")\n";
+    }
+  }
+  dbgs() << "--- End of dump ---\n";
+}
+
 } // namespace llvm::sandboxir

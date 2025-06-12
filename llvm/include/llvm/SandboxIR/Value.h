@@ -235,6 +235,11 @@ public:
   iterator_range<const_user_iterator> users() const {
     return make_range<const_user_iterator>(user_begin(), user_end());
   }
+
+  /// Create by myself
+  /// Return if the use list is empty
+  bool use_empty() const { return use_begin() == use_end(); }
+
   /// \Returns the number of user edges (not necessarily to unique users).
   /// WARNING: This is a linear-time operation.
   unsigned getNumUses() const;

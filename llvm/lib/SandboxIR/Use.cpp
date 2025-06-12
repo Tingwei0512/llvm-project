@@ -16,7 +16,8 @@ Value *Use::get() const { return Ctx->getValue(LLVMUse->get()); }
 
 void Use::set(Value *V) {
   Ctx->getTracker().emplaceIfTracking<UseSet>(*this);
-  LLVMUse->set(V->Val);
+  // LLVMUse->set(V->Val);
+  LLVMUse->set(V ? V->Val : nullptr);
 }
 
 unsigned Use::getOperandNo() const { return Usr->getUseOperandNo(*this); }
