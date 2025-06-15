@@ -3317,6 +3317,17 @@ public:
              })))
           DeadInsts.push_back(OpI);
       }
+      /////////////////////////
+      LLVM_DEBUG(I->dump());
+      if (I->getParent()) {
+        LLVM_DEBUG(dbgs() << "... in basic block: "
+                          << I->getParent()->getName() << "\n");
+        LLVM_DEBUG(dbgs() << "... in function: "
+                          << I->getParent()->getParent()->getName() << "\n");
+      } else {
+        LLVM_DEBUG(dbgs() << "... instruction has no parent basic block.\n");
+      }
+      /////////////////////////
       I->dropAllReferences();
     }
     for (T *V : DeadVals) {
@@ -6061,6 +6072,9 @@ static Value *SBcreateInsertVector(
     // llvm::CallInst *CI = llvm::dyn_cast<llvm::CallInst>(Vec);
     // Ctx.createCallInst(CI);
     Ctx.registerCreatedValue(Vec);
+    if (!Ctx.getValue(Vec)) LLVM_DEBUG(dbgs() << "@SLP: sobadinst: " << Vec->getName() << "\n");
+    else LLVM_DEBUG(dbgs() << "@SLP: sogoodinst: " << Vec->getName() << "\n");
+    LLVM_DEBUG(Vec->dump());
   } else {
     // Create shuffle, insertvector requires that index is multiple of
     // the subvector length.
@@ -6083,6 +6097,9 @@ static Value *SBcreateInsertVector(
       // else 
       //   llvm_unreachable("Unhandled V type!");
       Ctx.registerCreatedValue(V);
+      if (!Ctx.getValue(V)) LLVM_DEBUG(dbgs() << "@SLP: sobadinst: " << V->getName() << "\n");
+      else LLVM_DEBUG(dbgs() << "@SLP: sogoodinst: " << V->getName() << "\n");
+      LLVM_DEBUG(V->dump());
       Vec = Builder.CreateShuffleVector(Vec, V, Mask);
       // if (auto *svi = dyn_cast<ShuffleVectorInst>(Vec)) 
       //   Ctx.createShuffleVectorInst(svi);
@@ -6091,6 +6108,9 @@ static Value *SBcreateInsertVector(
       // else 
       //   llvm_unreachable("Unhandled Vec type!");
       Ctx.registerCreatedValue(Vec);
+      if (!Ctx.getValue(Vec)) LLVM_DEBUG(dbgs() << "@SLP: sobadinst: " << Vec->getName() << "\n");
+      else LLVM_DEBUG(dbgs() << "@SLP: sogoodinst: " << Vec->getName() << "\n");
+      LLVM_DEBUG(Vec->dump());
     }
   }
   return Vec;
@@ -6123,6 +6143,9 @@ static Value *SBcreateExtractVector(IRBuilderBase &Builder, Value *Vec,
     // sandboxir::CallInst *CI = dyn_cast<CallInst>(Ex);
     // Ctx.createCallInst(CI);
     Ctx.registerCreatedValue(Ex);
+    if (!Ctx.getValue(Ex)) LLVM_DEBUG(dbgs() << "@SLP: sobadinst: " << Ex->getName() << "\n");
+    else LLVM_DEBUG(dbgs() << "@SLP: sogoodinst: " << Ex->getName() << "\n");
+    LLVM_DEBUG(Ex->dump());
     return Ex;
   }
   // Create shuffle, extract_subvector requires that index is multiple of
@@ -6137,6 +6160,9 @@ static Value *SBcreateExtractVector(IRBuilderBase &Builder, Value *Vec,
   // else 
   //   llvm_unreachable("Unhandled Vec type!");
   Ctx.registerCreatedValue(Shuffle);
+  if (!Ctx.getValue(Shuffle)) LLVM_DEBUG(dbgs() << "@SLP: sobadinst: " << Shuffle->getName() << "\n");
+  else LLVM_DEBUG(dbgs() << "@SLP: sogoodinst: " << Shuffle->getName() << "\n");
+  LLVM_DEBUG(Shuffle->dump());
   return Shuffle;
 }
 
@@ -23070,6 +23096,8 @@ Value *BoUpSLP::SBvectorizeTree(
               //   Ctx.getOrCreateConstant(c);
               // else 
               //   llvm_unreachable("Unhandled Vec type!");
+              LLVM_DEBUG(dbgs() << "@@SLP: Ex1: ");
+              LLVM_DEBUG(Ex->dump());
               Ctx.registerCreatedValue(Ex);
             } else {
               Ex = Builder.CreateExtractElement(Vec, Lane);
@@ -23080,6 +23108,8 @@ Value *BoUpSLP::SBvectorizeTree(
               //   Ctx.getOrCreateConstant(c);
               // else 
               //   llvm_unreachable("Unhandled Vec type!");
+              LLVM_DEBUG(dbgs() << "@@SLP: Ex2: ");
+              LLVM_DEBUG(Ex->dump());
               Ctx.registerCreatedValue(Ex);
             }
           } else if (auto *VecTy =
@@ -23100,6 +23130,8 @@ Value *BoUpSLP::SBvectorizeTree(
             //   Ctx.getOrCreateConstant(c);
             // else 
             //   llvm_unreachable("Unhandled Vec type!");
+            LLVM_DEBUG(dbgs() << "@@SLP: Ex3: ");
+            LLVM_DEBUG(Ex->dump());
             Ctx.registerCreatedValue(Ex);
           }
           // If necessary, sign-extend or zero-extend ScalarRoot
@@ -23566,6 +23598,8 @@ Value *BoUpSLP::SBvectorizeTree(
   // - instructions are not deleted until later.
   LLVM_DEBUG(dbgs() << "@@SLP1 "<< ".\n");
   SBremoveInstructionsAndOperands(Ctx, ArrayRef(RemovedInsts), VectorValuesAndScales);
+  // removeInstructionsAndOperands(ArrayRef(RemovedInsts), VectorValuesAndScales);
+
   LLVM_DEBUG(dbgs() << "@@SLP2 "<< ".\n");
   Builder.ClearInsertionPoint();
   InstrElementSize.clear();
@@ -25213,6 +25247,14 @@ bool SLPVectorizerPass::runImpl(Function &F, ScalarEvolution *SE_,
   sandboxir::Context Ctx(F.getContext());
   auto *SBF = Ctx.createFunction(&F);
   // Ctx.dumpMap();
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      if (isa<ExtractElementInst>(I)) {
+        LLVM_DEBUG(dbgs() << "@@SLP: ExtractElementInst: " << I.getName() << "\n");
+        LLVM_DEBUG(I.dump());
+      }
+    }
+  }
   
   Stores.clear();
   GEPs.clear();
@@ -25258,7 +25300,16 @@ bool SLPVectorizerPass::runImpl(Function &F, ScalarEvolution *SE_,
       UseSandboxIRForStores = true;
       Changed |= vectorizeStoreChains(R, Ctx);
       UseSandboxIRForStores = false;
+      for (BasicBlock &BB : F) {
+        for (Instruction &I : BB) {
+          if (!Ctx.getValue(&I)) {
+            LLVM_DEBUG(dbgs() << "@@@SLP: badinst: " << I.getName() << "\n");
+            LLVM_DEBUG(I.dump());
+          }
+        }
+      }
     }
+    LLVM_DEBUG(dbgs() << "@@SLP: stores vectorized\n");
 
     // Vectorize trees that end at reductions.
     Changed |= vectorizeChainsInBlock(BB, R);
