@@ -3318,15 +3318,15 @@ public:
           DeadInsts.push_back(OpI);
       }
       /////////////////////////
-      LLVM_DEBUG(I->dump());
-      if (I->getParent()) {
-        LLVM_DEBUG(dbgs() << "... in basic block: "
-                          << I->getParent()->getName() << "\n");
-        LLVM_DEBUG(dbgs() << "... in function: "
-                          << I->getParent()->getParent()->getName() << "\n");
-      } else {
-        LLVM_DEBUG(dbgs() << "... instruction has no parent basic block.\n");
-      }
+      // LLVM_DEBUG(I->dump());
+      // if (I->getParent()) {
+      //   LLVM_DEBUG(dbgs() << "... in basic block: "
+      //                     << I->getParent()->getName() << "\n");
+      //   LLVM_DEBUG(dbgs() << "... in function: "
+      //                     << I->getParent()->getParent()->getName() << "\n");
+      // } else {
+      //   LLVM_DEBUG(dbgs() << "... instruction has no parent basic block.\n");
+      // }
       /////////////////////////
       I->dropAllReferences();
     }
@@ -3394,12 +3394,12 @@ public:
       ArrayRef<T *> DeadVals,
       ArrayRef<std::tuple<Value *, unsigned, bool>> VectorValuesAndScales) {
     SmallVector<WeakTrackingVH> DeadInsts;
-    LLVM_DEBUG(dbgs() << "@@SLP3 "<< ".\n");
+    // LLVM_DEBUG(dbgs() << "@@SLP3 "<< ".\n");
     for (T *V : DeadVals) {
       auto *I = cast<Instruction>(V);
       eraseInstruction(I);
     }
-    LLVM_DEBUG(dbgs() << "@@SLP4 "<< ".\n");
+    // LLVM_DEBUG(dbgs() << "@@SLP4 "<< ".\n");
     DenseSet<Value *> Processed;
     for (T *V : DeadVals) {
       if (!V || !Processed.insert(V).second)
@@ -3415,7 +3415,7 @@ public:
                return Entry->VectorizedValue == OpI;
              })))
           DeadInsts.push_back(OpI);
-        LLVM_DEBUG(dbgs() << "@@SLP5 "<< ".\n");
+        // LLVM_DEBUG(dbgs() << "@@SLP5 "<< ".\n");
       }
       // I->dropAllReferences();
       // Do it in a sandboxir way
@@ -3427,42 +3427,42 @@ public:
       // }
       // maybe i understand, let's first copy the operands
       // Ctx.dumpMap();
-      if (!Ctx.getValue(I)) {
-        // Ctx.registerInstruction(I);
-        // LLVM_DEBUG(dbgs() << "@@SLP6.1 "<< ".\n");
-        LLVM_DEBUG(dbgs() << "@@SLP6.1: Ctx.getValue(I) is null for I:\n");
-        LLVM_DEBUG(I->dump());
-        if (I->getParent()) {
-          LLVM_DEBUG(dbgs() << "... in basic block: "
-                            << I->getParent()->getName() << "\n");
-          LLVM_DEBUG(dbgs() << "... in function: "
-                            << I->getParent()->getParent()->getName() << "\n");
-        } else {
-          LLVM_DEBUG(dbgs() << "... instruction has no parent basic block.\n");
-        }
-      }
+      // if (!Ctx.getValue(I)) {
+      //   // Ctx.registerInstruction(I);
+      //   // LLVM_DEBUG(dbgs() << "@@SLP6.1 "<< ".\n");
+      //   LLVM_DEBUG(dbgs() << "@@SLP6.1: Ctx.getValue(I) is null for I:\n");
+      //   LLVM_DEBUG(I->dump());
+      //   if (I->getParent()) {
+      //     LLVM_DEBUG(dbgs() << "... in basic block: "
+      //                       << I->getParent()->getName() << "\n");
+      //     LLVM_DEBUG(dbgs() << "... in function: "
+      //                       << I->getParent()->getParent()->getName() << "\n");
+      //   } else {
+      //     LLVM_DEBUG(dbgs() << "... instruction has no parent basic block.\n");
+      //   }
+      // }
       sandboxir::Instruction *SBI =
           cast<sandboxir::Instruction>(Ctx.getValue(I));
-      LLVM_DEBUG(dbgs() << "@@SLP6 "<< ".\n");
+      // LLVM_DEBUG(dbgs() << "@@SLP6 "<< ".\n");
 
       SmallVector<sandboxir::Use, 8> OperandsToProcess;
       for (auto &&U : SBI->operands()) {
         OperandsToProcess.push_back(U);
       }
-      LLVM_DEBUG(dbgs() << "@@SLP7 "<< ".\n");
+      // LLVM_DEBUG(dbgs() << "@@SLP7 "<< ".\n");
       // for (sandboxir::Use &SBU : OperandsToProcess) {
       //   SBU.set(nullptr);
       // }
       while (!OperandsToProcess.empty()) {
         OperandsToProcess.pop_back_val().set(nullptr);
-        LLVM_DEBUG(dbgs() << "@@SLP8.1 "<< ".\n");
+        // LLVM_DEBUG(dbgs() << "@@SLP8.1 "<< ".\n");
       }
-      LLVM_DEBUG(dbgs() << "@@SLP8 "<< ".\n");
+      // LLVM_DEBUG(dbgs() << "@@SLP8 "<< ".\n");
     }
-    LLVM_DEBUG(dbgs() << "@@SLP9 "<< ".\n");
+    // LLVM_DEBUG(dbgs() << "@@SLP9 "<< ".\n");
     for (T *V : DeadVals) {
       auto *I = cast<Instruction>(V);
-      LLVM_DEBUG(dbgs() << "@@SLP10 "<< ".\n");
+      // LLVM_DEBUG(dbgs() << "@@SLP10 "<< ".\n");
       if (!I->getParent())
         continue;
       assert((I->use_empty() || all_of(I->uses(),
@@ -3474,7 +3474,7 @@ public:
       // I->removeFromParent();
       // Do it in a sandboxir way
       sandboxir::Instruction *SBI = cast<sandboxir::Instruction>(Ctx.getValue(I));
-      LLVM_DEBUG(dbgs() << "@@SLP11 "<< ".\n");
+      // LLVM_DEBUG(dbgs() << "@@SLP11 "<< ".\n");
       SBI->removeFromParent();
       SE->forgetValue(I);
     }
@@ -3496,22 +3496,25 @@ public:
 
       // Do it in a sandboxir way
       sandboxir::Instruction *SBI = cast<sandboxir::Instruction>(Ctx.getValue(VI));
-      LLVM_DEBUG(dbgs() << "@@SLP12 "<< ".\n");
+      // LLVM_DEBUG(dbgs() << "@@SLP12 "<< ".\n");
       SmallVector<sandboxir::Use, 8> OperandsToProcess;
       for (auto &&U : SBI->operands()) {
         OperandsToProcess.push_back(U);
       }
-      for (sandboxir::Use &OpU : OperandsToProcess) {
+      
+      while (!OperandsToProcess.empty()) {
+        // LLVM_DEBUG(dbgs() << "@@SLP13 "<< ".\n");
+        sandboxir::Use OpU = OperandsToProcess.pop_back_val();
         sandboxir::Value *OpV = OpU.get();
         if (!OpV)
           continue;
-        
+        // LLVM_DEBUG(dbgs() << "@@SLP14 "<< ".\n");
         // This modification is now safe and traceable.
         OpU.set(nullptr);
-
-        if (!OpV->use_empty())
+        // LLVM_DEBUG(dbgs() << "@@SLP15 "<< ".\n");
+        if (!OpV->getLLVMValue()->use_empty())
           continue;
-
+        // LLVM_DEBUG(dbgs() << "@@SLP16 "<< ".\n");
         // If the operand is an instruction that became dead as we nulled out
         // the operand, and if it is 'trivially' dead, delete it in a future
         // loop iteration.
@@ -3528,6 +3531,33 @@ public:
           }
         }
       }
+      // for (sandboxir::Use &OpU : OperandsToProcess) {
+      //   sandboxir::Value *OpV = OpU.get();
+      //   if (!OpV)
+      //     continue;
+        
+      //   // This modification is now safe and traceable.
+      //   OpU.set(nullptr);
+
+      //   if (!OpV->use_empty())
+      //     continue;
+
+      //   // If the operand is an instruction that became dead as we nulled out
+      //   // the operand, and if it is 'trivially' dead, delete it in a future
+      //   // loop iteration.
+      //   if (auto *OpSBInst = dyn_cast<sandboxir::Instruction>(OpV)) {
+      //     if (auto *OpI = dyn_cast<Instruction>(OpSBInst->getLLVMValue())) {
+      //       if (!DeletedInstructions.contains(OpI) &&
+      //           (!OpI->getType()->isVectorTy() ||
+      //            none_of(VectorValuesAndScales,
+      //                    [&](const std::tuple<Value *, unsigned, bool> &V) {
+      //                      return std::get<0>(V) == OpI;
+      //                    })) &&
+      //           isInstructionTriviallyDead(OpI, TLI))
+      //         DeadInsts.push_back(OpI);
+      //     }
+      //   }
+      // }
       // 1. First, collect copies of the Use objects into a stable container.
       // for (sandboxir::Use &OpU : SBI->operands()) {
       //   sandboxir::Value *OpV = OpU.get();
@@ -3554,12 +3584,41 @@ public:
 
       // VI->removeFromParent();
       // Do it in a sandboxir way
+      // LLVM_DEBUG(dbgs() << "@@SLP17 "<< ".\n");
       SBI->removeFromParent();
+      // LLVM_DEBUG(dbgs() << "@@SLP18 "<< ".\n");
       eraseInstruction(VI);
       SE->forgetValue(VI);
     }
   }
 
+  /// iterate over all instructions in the function for dbg
+  void iterateOverInstructions(sandboxir::Context &Ctx) {
+    for (BasicBlock &BB : *F) {
+      for (Instruction &I : BB) {
+        if (!Ctx.getValue(&I)) {
+          LLVM_DEBUG(dbgs() << "**SLP: nonreginst: " << I.getName() << "\n");
+          LLVM_DEBUG(I.dump());
+        }
+        // else {
+        //   LLVM_DEBUG(dbgs() << "**SLP: reginst: " << I.getName() << "\n");
+        //   LLVM_DEBUG(I.dump());
+        // }
+      }
+    }
+  }
+
+  /// iterate over all instructions in the function and register vlaues to sandboxir
+  void iterateOverInstructionsandregister(sandboxir::Context &Ctx) {
+    for (BasicBlock &BB : *F) {
+      for (Instruction &I : BB) {
+        if (!Ctx.getValue(&I)) {
+          Ctx.registerCreatedValue(&I);
+        }
+      }
+    }
+  }
+  
   /// Checks if the instruction was already analyzed for being possible
   /// reduction root.
   bool isAnalyzedReductionRoot(Instruction *I) const {
@@ -6072,9 +6131,9 @@ static Value *SBcreateInsertVector(
     // llvm::CallInst *CI = llvm::dyn_cast<llvm::CallInst>(Vec);
     // Ctx.createCallInst(CI);
     Ctx.registerCreatedValue(Vec);
-    if (!Ctx.getValue(Vec)) LLVM_DEBUG(dbgs() << "@SLP: sobadinst: " << Vec->getName() << "\n");
-    else LLVM_DEBUG(dbgs() << "@SLP: sogoodinst: " << Vec->getName() << "\n");
-    LLVM_DEBUG(Vec->dump());
+    // if (!Ctx.getValue(Vec)) LLVM_DEBUG(dbgs() << "@SLP: sobadinst: " << Vec->getName() << "\n");
+    // else LLVM_DEBUG(dbgs() << "@SLP: sogoodinst: " << Vec->getName() << "\n");
+    // LLVM_DEBUG(Vec->dump());
   } else {
     // Create shuffle, insertvector requires that index is multiple of
     // the subvector length.
@@ -6097,9 +6156,9 @@ static Value *SBcreateInsertVector(
       // else 
       //   llvm_unreachable("Unhandled V type!");
       Ctx.registerCreatedValue(V);
-      if (!Ctx.getValue(V)) LLVM_DEBUG(dbgs() << "@SLP: sobadinst: " << V->getName() << "\n");
-      else LLVM_DEBUG(dbgs() << "@SLP: sogoodinst: " << V->getName() << "\n");
-      LLVM_DEBUG(V->dump());
+      // if (!Ctx.getValue(V)) LLVM_DEBUG(dbgs() << "@SLP: sobadinst: " << V->getName() << "\n");
+      // else LLVM_DEBUG(dbgs() << "@SLP: sogoodinst: " << V->getName() << "\n");
+      // LLVM_DEBUG(V->dump());
       Vec = Builder.CreateShuffleVector(Vec, V, Mask);
       // if (auto *svi = dyn_cast<ShuffleVectorInst>(Vec)) 
       //   Ctx.createShuffleVectorInst(svi);
@@ -6108,9 +6167,9 @@ static Value *SBcreateInsertVector(
       // else 
       //   llvm_unreachable("Unhandled Vec type!");
       Ctx.registerCreatedValue(Vec);
-      if (!Ctx.getValue(Vec)) LLVM_DEBUG(dbgs() << "@SLP: sobadinst: " << Vec->getName() << "\n");
-      else LLVM_DEBUG(dbgs() << "@SLP: sogoodinst: " << Vec->getName() << "\n");
-      LLVM_DEBUG(Vec->dump());
+      // if (!Ctx.getValue(Vec)) LLVM_DEBUG(dbgs() << "@SLP: sobadinst: " << Vec->getName() << "\n");
+      // else LLVM_DEBUG(dbgs() << "@SLP: sogoodinst: " << Vec->getName() << "\n");
+      // LLVM_DEBUG(Vec->dump());
     }
   }
   return Vec;
@@ -6143,9 +6202,9 @@ static Value *SBcreateExtractVector(IRBuilderBase &Builder, Value *Vec,
     // sandboxir::CallInst *CI = dyn_cast<CallInst>(Ex);
     // Ctx.createCallInst(CI);
     Ctx.registerCreatedValue(Ex);
-    if (!Ctx.getValue(Ex)) LLVM_DEBUG(dbgs() << "@SLP: sobadinst: " << Ex->getName() << "\n");
-    else LLVM_DEBUG(dbgs() << "@SLP: sogoodinst: " << Ex->getName() << "\n");
-    LLVM_DEBUG(Ex->dump());
+    // if (!Ctx.getValue(Ex)) LLVM_DEBUG(dbgs() << "@SLP: sobadinst: " << Ex->getName() << "\n");
+    // else LLVM_DEBUG(dbgs() << "@SLP: sogoodinst: " << Ex->getName() << "\n");
+    // LLVM_DEBUG(Ex->dump());
     return Ex;
   }
   // Create shuffle, extract_subvector requires that index is multiple of
@@ -6160,9 +6219,9 @@ static Value *SBcreateExtractVector(IRBuilderBase &Builder, Value *Vec,
   // else 
   //   llvm_unreachable("Unhandled Vec type!");
   Ctx.registerCreatedValue(Shuffle);
-  if (!Ctx.getValue(Shuffle)) LLVM_DEBUG(dbgs() << "@SLP: sobadinst: " << Shuffle->getName() << "\n");
-  else LLVM_DEBUG(dbgs() << "@SLP: sogoodinst: " << Shuffle->getName() << "\n");
-  LLVM_DEBUG(Shuffle->dump());
+  // if (!Ctx.getValue(Shuffle)) LLVM_DEBUG(dbgs() << "@SLP: sobadinst: " << Shuffle->getName() << "\n");
+  // else LLVM_DEBUG(dbgs() << "@SLP: sogoodinst: " << Shuffle->getName() << "\n");
+  // LLVM_DEBUG(Shuffle->dump());
   return Shuffle;
 }
 
@@ -23096,8 +23155,8 @@ Value *BoUpSLP::SBvectorizeTree(
               //   Ctx.getOrCreateConstant(c);
               // else 
               //   llvm_unreachable("Unhandled Vec type!");
-              LLVM_DEBUG(dbgs() << "@@SLP: Ex1: ");
-              LLVM_DEBUG(Ex->dump());
+              // LLVM_DEBUG(dbgs() << "@@SLP: Ex1: ");
+              // LLVM_DEBUG(Ex->dump());
               Ctx.registerCreatedValue(Ex);
             } else {
               Ex = Builder.CreateExtractElement(Vec, Lane);
@@ -23108,8 +23167,8 @@ Value *BoUpSLP::SBvectorizeTree(
               //   Ctx.getOrCreateConstant(c);
               // else 
               //   llvm_unreachable("Unhandled Vec type!");
-              LLVM_DEBUG(dbgs() << "@@SLP: Ex2: ");
-              LLVM_DEBUG(Ex->dump());
+              // LLVM_DEBUG(dbgs() << "@@SLP: Ex2: ");
+              // LLVM_DEBUG(Ex->dump());
               Ctx.registerCreatedValue(Ex);
             }
           } else if (auto *VecTy =
@@ -23130,8 +23189,8 @@ Value *BoUpSLP::SBvectorizeTree(
             //   Ctx.getOrCreateConstant(c);
             // else 
             //   llvm_unreachable("Unhandled Vec type!");
-            LLVM_DEBUG(dbgs() << "@@SLP: Ex3: ");
-            LLVM_DEBUG(Ex->dump());
+            // LLVM_DEBUG(dbgs() << "@@SLP: Ex3: ");
+            // LLVM_DEBUG(Ex->dump());
             Ctx.registerCreatedValue(Ex);
           }
           // If necessary, sign-extend or zero-extend ScalarRoot
@@ -23581,7 +23640,7 @@ Value *BoUpSLP::SBvectorizeTree(
         // SI->setCondition(Constant::getNullValue(SI->getCondition()->getType()));
         auto *SBSI = dyn_cast_or_null<sandboxir::SelectInst>(Ctx.getValue(SI));
         if (!SBSI) {
-          LLVM_DEBUG(dbgs() << "@@SLP: \tNot a select instruction:" << *SI << ".\n");
+          // LLVM_DEBUG(dbgs() << "@@SLP: \tNot a select instruction:" << *SI << ".\n");
           continue;
         }
         Constant *NullValueLLVM =
@@ -23596,11 +23655,11 @@ Value *BoUpSLP::SBvectorizeTree(
   // cache correctness.
   // NOTE: removeInstructionAndOperands only marks the instruction for deletion
   // - instructions are not deleted until later.
-  LLVM_DEBUG(dbgs() << "@@SLP1 "<< ".\n");
+  // LLVM_DEBUG(dbgs() << "@@SLP1 "<< ".\n");
   SBremoveInstructionsAndOperands(Ctx, ArrayRef(RemovedInsts), VectorValuesAndScales);
   // removeInstructionsAndOperands(ArrayRef(RemovedInsts), VectorValuesAndScales);
 
-  LLVM_DEBUG(dbgs() << "@@SLP2 "<< ".\n");
+  // LLVM_DEBUG(dbgs() << "@@SLP2 "<< ".\n");
   Builder.ClearInsertionPoint();
   InstrElementSize.clear();
 
@@ -25247,14 +25306,6 @@ bool SLPVectorizerPass::runImpl(Function &F, ScalarEvolution *SE_,
   sandboxir::Context Ctx(F.getContext());
   auto *SBF = Ctx.createFunction(&F);
   // Ctx.dumpMap();
-  for (BasicBlock &BB : F) {
-    for (Instruction &I : BB) {
-      if (isa<ExtractElementInst>(I)) {
-        LLVM_DEBUG(dbgs() << "@@SLP: ExtractElementInst: " << I.getName() << "\n");
-        LLVM_DEBUG(I.dump());
-      }
-    }
-  }
   
   Stores.clear();
   GEPs.clear();
@@ -25297,19 +25348,27 @@ bool SLPVectorizerPass::runImpl(Function &F, ScalarEvolution *SE_,
     if (!Stores.empty()) {
       LLVM_DEBUG(dbgs() << "SLP: Found stores for " << Stores.size()
                         << " underlying objects.\n");
+      // for (BasicBlock &BB : F) {
+      //   for (Instruction &I : BB) {
+      //     if (!Ctx.getValue(&I)) {
+      //       LLVM_DEBUG(dbgs() << "@@@SLP: badinstbefore: " << I.getName() << "\n");
+      //       LLVM_DEBUG(I.dump());
+      //     }
+      //   }
+      // }
       UseSandboxIRForStores = true;
       Changed |= vectorizeStoreChains(R, Ctx);
       UseSandboxIRForStores = false;
-      for (BasicBlock &BB : F) {
-        for (Instruction &I : BB) {
-          if (!Ctx.getValue(&I)) {
-            LLVM_DEBUG(dbgs() << "@@@SLP: badinst: " << I.getName() << "\n");
-            LLVM_DEBUG(I.dump());
-          }
-        }
-      }
+      // for (BasicBlock &BB : F) {
+      //   for (Instruction &I : BB) {
+      //     if (!Ctx.getValue(&I)) {
+      //       LLVM_DEBUG(dbgs() << "@@@SLP: badinstafter: " << I.getName() << "\n");
+      //       LLVM_DEBUG(I.dump());
+      //     }
+      //   }
+      // }
     }
-    LLVM_DEBUG(dbgs() << "@@SLP: stores vectorized\n");
+    // LLVM_DEBUG(dbgs() << "@@SLP: stores vectorized\n");
 
     // Vectorize trees that end at reductions.
     Changed |= vectorizeChainsInBlock(BB, R);
@@ -25321,6 +25380,9 @@ bool SLPVectorizerPass::runImpl(Function &F, ScalarEvolution *SE_,
       LLVM_DEBUG(dbgs() << "SLP: Found GEPs for " << GEPs.size()
                         << " underlying objects.\n");
       Changed |= vectorizeGEPIndices(BB, R);
+    }
+    if (Changed) {
+      R.iterateOverInstructionsandregister(Ctx);
     }
   }
 
@@ -25335,6 +25397,8 @@ std::optional<bool>
 SLPVectorizerPass::vectorizeStoreChain(ArrayRef<Value *> Chain, BoUpSLP &R,
                                        unsigned Idx, unsigned MinVF,
                                        unsigned &Size, sandboxir::Context& Ctx) {
+  // LLVM_DEBUG(dbgs() << "**1: \n");
+  // R.iterateOverInstructions(Ctx);
   Size = 0;
   LLVM_DEBUG(dbgs() << "SLP: Analyzing a store chain of length " << Chain.size()
                     << "\n");
@@ -25384,7 +25448,11 @@ SLPVectorizerPass::vectorizeStoreChain(ArrayRef<Value *> Chain, BoUpSLP &R,
   }
   if (R.isLoadCombineCandidate(Chain))
     return true;
+  // LLVM_DEBUG(dbgs() << "**2: \n");
+  // R.iterateOverInstructions(Ctx);
   R.buildTree(Chain);
+  // LLVM_DEBUG(dbgs() << "**3: \n");
+  // R.iterateOverInstructions(Ctx);
   // Check if tree tiny and store itself or its value is not vectorized.
   if (R.isTreeTinyAndNotFullyVectorizable()) {
     if (R.isGathered(Chain.front()) ||
@@ -25393,20 +25461,28 @@ SLPVectorizerPass::vectorizeStoreChain(ArrayRef<Value *> Chain, BoUpSLP &R,
     Size = R.getCanonicalGraphSize();
     return false;
   }
+  // LLVM_DEBUG(dbgs() << "**4: \n");
+  // R.iterateOverInstructions(Ctx);
   if (R.isProfitableToReorder()) {
     R.reorderTopToBottom();
     R.reorderBottomToTop();
   }
+  // LLVM_DEBUG(dbgs() << "**5: \n");
+  // R.iterateOverInstructions(Ctx);
   R.transformNodes();
+  // LLVM_DEBUG(dbgs() << "**6: \n");
+  // R.iterateOverInstructions(Ctx);
   R.buildExternalUses();
 
   R.computeMinimumValueSizes();
-
+  // LLVM_DEBUG(dbgs() << "**7: \n");
+  // R.iterateOverInstructions(Ctx);
   Size = R.getCanonicalGraphSize();
   if (S && S.getOpcode() == Instruction::Load)
     Size = 2; // cut off masked gather small trees
   InstructionCost Cost = R.getTreeCost();
-
+  // LLVM_DEBUG(dbgs() << "**8: \n");
+  // R.iterateOverInstructions(Ctx);
   LLVM_DEBUG(dbgs() << "SLP: Found cost = " << Cost << " for VF=" << VF << "\n");
   if (Cost < -SLPCostThreshold) {
     LLVM_DEBUG(dbgs() << "SLP: Decided to vectorize cost = " << Cost << "\n");
@@ -25418,8 +25494,11 @@ SLPVectorizerPass::vectorizeStoreChain(ArrayRef<Value *> Chain, BoUpSLP &R,
                      << "Stores SLP vectorized with cost " << NV("Cost", Cost)
                      << " and with tree size "
                      << NV("TreeSize", R.getTreeSize()));
-
+    // LLVM_DEBUG(dbgs() << "@@SLP: vectorizing tree\n");
+    // R.iterateOverInstructions(Ctx);
     R.SBvectorizeTree(Ctx);
+    // LLVM_DEBUG(dbgs() << "@@SLP: vectorized tree\n");
+    // R.iterateOverInstructions(Ctx);
     return true;
   }
 
@@ -25894,8 +25973,14 @@ bool SLPVectorizerPass::vectorizeStores(
   }
 
   // Final vectorization attempt.
-  for (RelatedStoreInsts &StoreSeq : SortedStores)
+  for (RelatedStoreInsts &StoreSeq : SortedStores) {
+    // LLVM_DEBUG(dbgs() << "**before try to vec: \n");
+    // R.iterateOverInstructions(Ctx);
     TryToVectorize(StoreSeq.getStores());
+    // LLVM_DEBUG(dbgs() << "**after try to vec: \n");
+    // R.iterateOverInstructions(Ctx);
+  }
+    
 
   return Changed;
 }
