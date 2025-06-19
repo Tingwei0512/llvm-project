@@ -1947,7 +1947,7 @@ public:
   unsigned getCanonicalGraphSize() const { return BaseGraphSize; }
 
   /// Perform LICM and CSE on the newly generated gather sequences.
-  void optimizeGatherSequence();
+  void optimizeGatherSequence(sandboxir::Context &Ctx);
 
   /// Does this non-empty order represent an identity order?  Identity
   /// should be represented as an empty order, so this is used to
@@ -5358,6 +5358,8 @@ private:
   /// Performs the "real" scheduling. Done before vectorization is actually
   /// performed in a basic block.
   void scheduleBlock(BlockScheduling *BS);
+
+  void SBscheduleBlock(BlockScheduling *BS, sandboxir::Context &Ctx);
 
   /// List of users to ignore during scheduling and that don't need extracting.
   const SmallDenseSet<Value *> *UserIgnoreList = nullptr;
@@ -22753,8 +22755,12 @@ Value *BoUpSLP::SBvectorizeTree(
   // need to rebuild it.
   EntryToLastInstruction.clear();
   // All blocks must be scheduled before any instructions are inserted.
-  for (auto &BSIter : BlocksSchedules)
-    scheduleBlock(BSIter.second.get());
+  for (auto &BSIter : BlocksSchedules) {
+    // LLVM_DEBUG(dbgs() << "@@11.\n");
+    SBscheduleBlock(BSIter.second.get(), Ctx);
+    // LLVM_DEBUG(dbgs() << "@@12.\n");
+  }
+    
   // Cache last instructions for the nodes to avoid side effects, which may
   // appear during vectorization, like extra uses, etc.
   for (const std::unique_ptr<TreeEntry> &TE : VectorizableTree) {
@@ -23686,7 +23692,7 @@ Value *BoUpSLP::SBvectorizeTree(
   return Vec;
 }
 
-void BoUpSLP::optimizeGatherSequence() {
+void BoUpSLP::optimizeGatherSequence(sandboxir::Context &Ctx) {
   LLVM_DEBUG(dbgs() << "SLP: Optimizing " << GatherShuffleExtractSeq.size()
                     << " gather sequences instructions.\n");
   // LICM InsertElementInst sequences.
@@ -23714,7 +23720,11 @@ void BoUpSLP::optimizeGatherSequence() {
       continue;
 
     // We can hoist this instruction. Move it to the pre-header.
-    I->moveBefore(PreHeader->getTerminator()->getIterator());
+    // I->moveBefore(PreHeader->getTerminator()->getIterator());
+    sandboxir::Instruction *SBI = dyn_cast<sandboxir::Instruction>(Ctx.getValue(I));
+    sandboxir::Instruction *SBPreHeader = dyn_cast<sandboxir::Instruction>(Ctx.getValue(PreHeader->getTerminator()));
+    // LLVM_DEBUG(dbgs() << "@@1.\n");
+    SBI->moveBefore(SBPreHeader);
     CSEBlocks.insert(PreHeader);
   }
 
@@ -23815,8 +23825,16 @@ void BoUpSLP::optimizeGatherSequence() {
             GatherShuffleExtractSeq.contains(V) &&
             IsIdenticalOrLessDefined(V, &In, NewMask) &&
             DT->dominates(In.getParent(), V->getParent())) {
-          In.moveAfter(V);
-          V->replaceAllUsesWith(&In);
+          // In.moveAfter(V);
+          // LLVM_DEBUG(dbgs() << "@@2.1.\n");
+          sandboxir::Instruction *SBIn = dyn_cast<sandboxir::Instruction>(Ctx.getValue(&In));
+          sandboxir::Instruction *SBV = dyn_cast<sandboxir::Instruction>(Ctx.getValue(V));
+          // LLVM_DEBUG(dbgs() << "@@2.\n");
+          SBIn->moveAfter(SBV);
+
+          // V->replaceAllUsesWith(&In);
+          SBV->replaceAllUsesWith(SBIn);
+
           eraseInstruction(V);
           if (auto *SI = dyn_cast<ShuffleVectorInst>(&In))
             if (!NewMask.empty())
@@ -24410,6 +24428,134 @@ void BoUpSLP::scheduleBlock(BlockScheduling *BS) {
 
   // Avoid duplicate scheduling of the block.
   BS->ScheduleStart = nullptr;
+}
+
+// sandboxir version of scheduleBlock
+void BoUpSLP::SBscheduleBlock(BlockScheduling *BS, sandboxir::Context &Ctx) {
+  if (!BS->ScheduleStart)
+    return;
+
+  LLVM_DEBUG(dbgs() << "SLP: schedule block " << BS->BB->getName() << "\n");
+
+  // A key point - if we got here, pre-scheduling was able to find a valid
+  // scheduling of the sub-graph of the scheduling window which consists
+  // of all vector bundles and their transitive users.  As such, we do not
+  // need to reschedule anything *outside of* that subgraph.
+
+  BS->resetSchedule();
+
+  // For the real scheduling we use a more sophisticated ready-list: it is
+  // sorted by the original instruction location. This lets the final schedule
+  // be as  close as possible to the original instruction order.
+  // WARNING: If changing this order causes a correctness issue, that means
+  // there is some missing dependence edge in the schedule data graph.
+  struct ScheduleDataCompare {
+    bool operator()(const ScheduleEntity *SD1,
+                    const ScheduleEntity *SD2) const {
+      return SD2->getSchedulingPriority() < SD1->getSchedulingPriority();
+    }
+  };
+  std::set<ScheduleEntity *, ScheduleDataCompare> ReadyInsts;
+
+  // Ensure that all dependency data is updated (for nodes in the sub-graph)
+  // and fill the ready-list with initial instructions.
+  int Idx = 0;
+  for (auto *I = BS->ScheduleStart; I != BS->ScheduleEnd;
+       I = I->getNextNode()) {
+    ArrayRef<ScheduleBundle *> Bundles = BS->getScheduleBundles(I);
+    if (!Bundles.empty()) {
+      for (ScheduleBundle *Bundle : Bundles) {
+        Bundle->setSchedulingPriority(Idx++);
+        if (!Bundle->hasValidDependencies())
+          BS->calculateDependencies(*Bundle, /*InsertInReadyList=*/false, this);
+      }
+      continue;
+    }
+    if (ScheduleData *SD = BS->getScheduleData(I)) {
+      [[maybe_unused]] ArrayRef<TreeEntry *> SDTEs = getTreeEntries(I);
+      assert((isVectorLikeInstWithConstOps(SD->getInst()) || SDTEs.empty() ||
+              doesNotNeedToSchedule(SDTEs.front()->Scalars)) &&
+             "scheduler and vectorizer bundle mismatch");
+      SD->setSchedulingPriority(Idx++);
+      continue;
+    }
+  }
+  BS->initialFillReadyList(ReadyInsts);
+
+  Instruction *LastScheduledInst = BS->ScheduleEnd;
+
+  // Do the "real" scheduling.
+  SmallPtrSet<Instruction *, 16> Scheduled;
+  while (!ReadyInsts.empty()) {
+    // LLVM_DEBUG(dbgs() << "@@16.\n");
+    auto *Picked = *ReadyInsts.begin();
+    ReadyInsts.erase(ReadyInsts.begin());
+
+    // Move the scheduled instruction(s) to their dedicated places, if not
+    // there yet.
+     // LLVM_DEBUG(dbgs() << "@@2.2.\n");
+    if (auto *Bundle = dyn_cast<ScheduleBundle>(Picked)) {
+      // LLVM_DEBUG(dbgs() << "@@2.3.\n");
+      for (const ScheduleData *BundleMember : Bundle->getBundle()) {
+        Instruction *PickedInst = BundleMember->getInst();
+        if (!Scheduled.insert(PickedInst).second)
+          continue;
+        if (PickedInst->getNextNonDebugInstruction() != LastScheduledInst) {
+          // PickedInst->moveAfter(LastScheduledInst->getPrevNode());
+          // LLVM_DEBUG(dbgs() << "@@3.\n");
+          sandboxir::Instruction *SBpickedInst = dyn_cast<sandboxir::Instruction>(Ctx.getValue(PickedInst));
+          sandboxir::Instruction *SBlastScheduledInst = dyn_cast<sandboxir::Instruction>(Ctx.getValue(LastScheduledInst->getPrevNode()));
+          SBpickedInst->moveAfter(SBlastScheduledInst);
+          // LLVM_DEBUG(dbgs() << "@@4.\n");
+        } 
+          
+        LastScheduledInst = PickedInst;
+      }
+      EntryToLastInstruction.try_emplace(Bundle->getTreeEntry(),
+                                         LastScheduledInst);
+    } else {
+      auto *SD = cast<ScheduleData>(Picked);
+      Instruction *PickedInst = SD->getInst();
+      if (PickedInst->getNextNonDebugInstruction() != LastScheduledInst) {
+        // PickedInst->moveAfter(LastScheduledInst->getPrevNode());
+        // LLVM_DEBUG(dbgs() << "@@5.\n");
+        sandboxir::Instruction *SBpickedInst = dyn_cast<sandboxir::Instruction>(Ctx.getValue(PickedInst));
+        sandboxir::Instruction *SBlastScheduledInst = dyn_cast<sandboxir::Instruction>(Ctx.getValue(LastScheduledInst->getPrevNode()));
+        SBpickedInst->moveAfter(SBlastScheduledInst);
+        // LLVM_DEBUG(dbgs() << "@@6.\n");
+      }
+      LastScheduledInst = PickedInst;
+    }
+    // LLVM_DEBUG(dbgs() << "@@7.\n");
+    BS->schedule(Picked, ReadyInsts);
+    // LLVM_DEBUG(dbgs() << "@@8.\n");
+  }
+
+  // Check that we didn't break any of our invariants.
+#ifdef EXPENSIVE_CHECKS
+  BS->verify();
+#endif
+
+#if !defined(NDEBUG) || defined(EXPENSIVE_CHECKS)
+  // Check that all schedulable entities got scheduled
+  // LLVM_DEBUG(dbgs() << "@@13.\n");
+  for (auto *I = BS->ScheduleStart; I != BS->ScheduleEnd;
+       I = I->getNextNode()) {
+    // LLVM_DEBUG(dbgs() << "@@14.\n");
+    ArrayRef<ScheduleBundle *> Bundles = BS->getScheduleBundles(I);
+    // LLVM_DEBUG(dbgs() << "@@15.\n");
+    assert(all_of(Bundles,
+                  [](const ScheduleBundle *Bundle) {
+                    return Bundle->isScheduled();
+                  }) &&
+           "must be scheduled at this point");
+  }
+#endif
+
+  // Avoid duplicate scheduling of the block.
+  // LLVM_DEBUG(dbgs() << "@@9.\n");
+  BS->ScheduleStart = nullptr;
+  // LLVM_DEBUG(dbgs() << "@@
 }
 
 unsigned BoUpSLP::getVectorElementSize(Value *V) {
@@ -25348,25 +25494,9 @@ bool SLPVectorizerPass::runImpl(Function &F, ScalarEvolution *SE_,
     if (!Stores.empty()) {
       LLVM_DEBUG(dbgs() << "SLP: Found stores for " << Stores.size()
                         << " underlying objects.\n");
-      // for (BasicBlock &BB : F) {
-      //   for (Instruction &I : BB) {
-      //     if (!Ctx.getValue(&I)) {
-      //       LLVM_DEBUG(dbgs() << "@@@SLP: badinstbefore: " << I.getName() << "\n");
-      //       LLVM_DEBUG(I.dump());
-      //     }
-      //   }
-      // }
       UseSandboxIRForStores = true;
       Changed |= vectorizeStoreChains(R, Ctx);
       UseSandboxIRForStores = false;
-      // for (BasicBlock &BB : F) {
-      //   for (Instruction &I : BB) {
-      //     if (!Ctx.getValue(&I)) {
-      //       LLVM_DEBUG(dbgs() << "@@@SLP: badinstafter: " << I.getName() << "\n");
-      //       LLVM_DEBUG(I.dump());
-      //     }
-      //   }
-      // }
     }
     // LLVM_DEBUG(dbgs() << "@@SLP: stores vectorized\n");
 
@@ -25387,7 +25517,7 @@ bool SLPVectorizerPass::runImpl(Function &F, ScalarEvolution *SE_,
   }
 
   if (Changed) {
-    R.optimizeGatherSequence();
+    R.optimizeGatherSequence(Ctx);
     LLVM_DEBUG(dbgs() << "SLP: vectorized \"" << F.getName() << "\"\n");
   }
   return Changed;
