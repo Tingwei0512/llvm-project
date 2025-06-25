@@ -1362,7 +1362,12 @@ static InstructionsState getSameOpcode(ArrayRef<Value *> VL,
   bool AnyPoison = InstCnt != VL.size();
   // Check MainOp too to be sure that it matches the requirements for the
   // instructions.
+  LLVM_DEBUG(dbgs() << "@@SLP: VL: \n");
+  for (Value *V : iterator_range(It, VL.end())) 
+    LLVM_DEBUG(V->dump());
+  LLVM_DEBUG(dbgs() << "@@SLP: VL end\n");
   for (Value *V : iterator_range(It, VL.end())) {
+    // LLVM_DEBUG(V->dump());
     auto *I = dyn_cast<Instruction>(V);
     if (!I)
       continue;
@@ -1778,6 +1783,46 @@ class BoUpSLP {
   class SBShuffleInstructionBuilder;
 
 public:
+
+  /// State Snapshot for reverting
+  struct StateSnapshot {
+
+    explicit StateSnapshot(BoUpSLP &R) 
+        : DeletedInstructions(R.DeletedInstructions),
+          AliasCache(R.AliasCache),
+          AnalyzedReductionsRoots(R.AnalyzedReductionsRoots),
+          AnalyzedReductionVals(R.AnalyzedReductionVals),
+          AnalyzedMinBWVals(R.AnalyzedMinBWVals),
+          CSEBlocks(R.CSEBlocks) {}
+
+    StateSnapshot() = delete;
+
+    DenseSet<Instruction *> DeletedInstructions;
+    SmallDenseMap<std::pair<Instruction *, Instruction *>, bool> AliasCache;
+    SmallPtrSet<Instruction *, 16> AnalyzedReductionsRoots;
+    DenseSet<size_t> AnalyzedReductionVals;
+    DenseSet<Value *> AnalyzedMinBWVals;
+    DenseSet<BasicBlock *> CSEBlocks;
+  };
+
+  void saveState(StateSnapshot &State) {
+    State.DeletedInstructions = this->DeletedInstructions;
+    State.AliasCache = this->AliasCache;
+    State.AnalyzedReductionsRoots = this->AnalyzedReductionsRoots;
+    State.AnalyzedReductionVals = this->AnalyzedReductionVals;
+    State.AnalyzedMinBWVals = this->AnalyzedMinBWVals;
+    State.CSEBlocks = this->CSEBlocks;
+  }
+
+  void restoreState(StateSnapshot &State) {
+    this->DeletedInstructions = State.DeletedInstructions;
+    this->AliasCache = State.AliasCache;
+    this->AnalyzedReductionsRoots = State.AnalyzedReductionsRoots;
+    this->AnalyzedReductionVals = State.AnalyzedReductionVals;
+    this->AnalyzedMinBWVals = State.AnalyzedMinBWVals;
+    this->CSEBlocks = State.CSEBlocks;
+  }
+
   /// Tracks the state we can represent the loads in the given sequence.
   enum class LoadsState {
     Gather,
@@ -3328,6 +3373,8 @@ public:
       //   LLVM_DEBUG(dbgs() << "... instruction has no parent basic block.\n");
       // }
       /////////////////////////
+      // LLVM_DEBUG(dbgs() << "@@ I dump: "<< "\n");
+      // LLVM_DEBUG(I->dump());
       I->dropAllReferences();
     }
     for (T *V : DeadVals) {
@@ -3362,6 +3409,8 @@ public:
         Value *OpV = OpU.get();
         if (!OpV)
           continue;
+        // LLVM_DEBUG(dbgs() << "@@ opu dump(ori): "<< "\n");
+        // LLVM_DEBUG(OpU.dump());
         OpU.set(nullptr);
 
         if (!OpV->use_empty())
@@ -3510,6 +3559,8 @@ public:
           continue;
         // LLVM_DEBUG(dbgs() << "@@SLP14 "<< ".\n");
         // This modification is now safe and traceable.
+        // LLVM_DEBUG(dbgs() << "@@ opu dump: "<< "\n");
+        // LLVM_DEBUG(OpU.dump());
         OpU.set(nullptr);
         // LLVM_DEBUG(dbgs() << "@@SLP15 "<< ".\n");
         if (!OpV->getLLVMValue()->use_empty())
@@ -3596,10 +3647,10 @@ public:
   void iterateOverInstructions(sandboxir::Context &Ctx) {
     for (BasicBlock &BB : *F) {
       for (Instruction &I : BB) {
-        if (!Ctx.getValue(&I)) {
-          LLVM_DEBUG(dbgs() << "**SLP: nonreginst: " << I.getName() << "\n");
+        // if (!Ctx.getValue(&I)) {
+          // LLVM_DEBUG(dbgs() << "**SLP: nonreginst: " << I.getName() << "\n");
           LLVM_DEBUG(I.dump());
-        }
+        // }
         // else {
         //   LLVM_DEBUG(dbgs() << "**SLP: reginst: " << I.getName() << "\n");
         //   LLVM_DEBUG(I.dump());
@@ -22724,6 +22775,7 @@ Value *BoUpSLP::vectorizeTree(
   // cache correctness.
   // NOTE: removeInstructionAndOperands only marks the instruction for deletion
   // - instructions are not deleted until later.
+  LLVM_DEBUG(dbgs() << "@@ RemovedInsts: \n");
   removeInstructionsAndOperands(ArrayRef(RemovedInsts), VectorValuesAndScales);
 
   Builder.ClearInsertionPoint();
@@ -22946,6 +22998,7 @@ Value *BoUpSLP::SBvectorizeTree(
     assert(Vec && "Can't find vectorizable value");
 
     Value *Lane = Builder.getInt32(ExternalUse.Lane);
+    sandboxir::Value *SBlane = Ctx.registerCreatedValue(Lane);
     auto ExtractAndExtendIfNeeded = [&](Value *Vec) {
       if (Scalar->getType() != Vec->getType()) {
         Value *Ex = nullptr;
@@ -25480,12 +25533,52 @@ bool SLPVectorizerPass::runImpl(Function &F, ScalarEvolution *SE_,
 
   // Update DFS numbers now so that we can use them for ordering.
   DT->updateDFSNumbers();
+  // BoUpSLP::StateSnapshot SS(R);
+  // Ctx.save();
+  // // Scan the blocks in the function in post order.
+  // for (auto *BB : post_order(&F.getEntryBlock())) {
+  //   if (BB->isEHPad() || isa_and_nonnull<UnreachableInst>(BB->getTerminator()))
+  //     continue;
 
-  // Scan the blocks in the function in post order.
+  //   // Start new block - clear the list of reduction roots.
+  //   R.clearReductionData();
+  //   collectSeedInstructions(BB);
+
+  //   // Vectorize trees that end at stores.
+  //   if (!Stores.empty()) {
+  //     LLVM_DEBUG(dbgs() << "SLP: Found stores for " << Stores.size()
+  //                       << " underlying objects.\n");
+  //     UseSandboxIRForStores = true;
+  //     Changed |= vectorizeStoreChains(R, Ctx);
+  //     UseSandboxIRForStores = false;
+  //   }
+  //   // LLVM_DEBUG(dbgs() << "@@SLP: stores vectorized\n");
+
+  //   // Vectorize trees that end at reductions.
+  //   Changed |= vectorizeChainsInBlock(BB, R);
+
+  //   // Vectorize the index computations of getelementptr instructions. This
+  //   // is primarily intended to catch gather-like idioms ending at
+  //   // non-consecutive loads.
+  //   if (!GEPs.empty()) {
+  //     LLVM_DEBUG(dbgs() << "SLP: Found GEPs for " << GEPs.size()
+  //                       << " underlying objects.\n");
+  //     Changed |= vectorizeGEPIndices(BB, R);
+  //   }
+  //   if (Changed) {
+  //     R.iterateOverInstructionsandregister(Ctx);
+  //   }
+  // }
+  // LLVM_DEBUG(dbgs() << "@@ end first pass\n");
+  // LLVM_DEBUG(Ctx.getTracker().dump());
+  // R.restoreState(SS);
+  // Ctx.revert();
+  // LLVM_DEBUG(dbgs() << "@@ reverted\n");
+  //////////////////////////////////////////////////////////////
   for (auto *BB : post_order(&F.getEntryBlock())) {
     if (BB->isEHPad() || isa_and_nonnull<UnreachableInst>(BB->getTerminator()))
       continue;
-
+    
     // Start new block - clear the list of reduction roots.
     R.clearReductionData();
     collectSeedInstructions(BB);
@@ -25498,8 +25591,7 @@ bool SLPVectorizerPass::runImpl(Function &F, ScalarEvolution *SE_,
       Changed |= vectorizeStoreChains(R, Ctx);
       UseSandboxIRForStores = false;
     }
-    // LLVM_DEBUG(dbgs() << "@@SLP: stores vectorized\n");
-
+    LLVM_DEBUG(dbgs() << "@@SLP: stores vectorized\n");
     // Vectorize trees that end at reductions.
     Changed |= vectorizeChainsInBlock(BB, R);
 
@@ -25511,11 +25603,14 @@ bool SLPVectorizerPass::runImpl(Function &F, ScalarEvolution *SE_,
                         << " underlying objects.\n");
       Changed |= vectorizeGEPIndices(BB, R);
     }
-    if (Changed) {
+    LLVM_DEBUG(dbgs() << "@@SLP: chains vectorized\n");
+    // R.iterateOverInstructions(Ctx);
+    // if (Changed) {
       R.iterateOverInstructionsandregister(Ctx);
-    }
+    // }
   }
-
+  //////////////////////////////////////////////////////////////
+  
   if (Changed) {
     R.optimizeGatherSequence(Ctx);
     LLVM_DEBUG(dbgs() << "SLP: vectorized \"" << F.getName() << "\"\n");
@@ -25554,7 +25649,7 @@ SLPVectorizerPass::vectorizeStoreChain(ArrayRef<Value *> Chain, BoUpSLP &R,
   for (Value *V : Chain)
     ValOps.insert(cast<StoreInst>(V)->getValueOperand());
   // Operands are not same/alt opcodes or non-power-of-2 uniques - exit.
-  InstructionsState S = getSameOpcode(ValOps.getArrayRef(), *TLI);
+  InstructionsState S = getSameOpcode(ValOps.getArrayRef(), *TLI); // Bug
   if (all_of(ValOps, IsaPred<Instruction>) && ValOps.size() > 1) {
     DenseSet<Value *> Stores(Chain.begin(), Chain.end());
     bool IsAllowedSize =
@@ -25576,9 +25671,10 @@ SLPVectorizerPass::vectorizeStoreChain(ArrayRef<Value *> Chain, BoUpSLP &R,
       return false;
     }
   }
+  LLVM_DEBUG(dbgs() << "**2.1: \n");
   if (R.isLoadCombineCandidate(Chain))
     return true;
-  // LLVM_DEBUG(dbgs() << "**2: \n");
+  LLVM_DEBUG(dbgs() << "**2.2: \n");
   // R.iterateOverInstructions(Ctx);
   R.buildTree(Chain);
   // LLVM_DEBUG(dbgs() << "**3: \n");
@@ -25912,8 +26008,25 @@ bool SLPVectorizerPass::vectorizeStores(
                 }
               }
               unsigned TreeSize;
+              BoUpSLP::StateSnapshot SS(R);//
+              // R.iterateOverInstructionsandregister(Ctx);
+              Ctx.save();//
+              // LLVM_DEBUG(dbgs() << "@@ first try\n");
+              // LLVM_DEBUG(dbgs() << "@@SLP: ir dump before---------------------------------------\n");
               std::optional<bool> Res =
                   vectorizeStoreChain(Slice, R, Cnt, MinVF, TreeSize, Ctx);
+              // LLVM_DEBUG(dbgs() << "@@SLP: ir dump after stores---------------------------------\n");
+              // R.iterateOverInstructions(Ctx);
+              // LLVM_DEBUG(dbgs() << "@@SLP: ir tracker dump---------------------------------\n");
+              // Ctx.getTracker().dump();
+              Ctx.revert();//
+              R.restoreState(SS);
+              // LLVM_DEBUG(dbgs() << "@@SLP: ir dump reverted-------------------------------------\n");
+              // R.iterateOverInstructions(Ctx);
+              // LLVM_DEBUG(dbgs() << "@@ reverted\n");
+              Res =//
+                  vectorizeStoreChain(Slice, R, Cnt, MinVF, TreeSize, Ctx);//
+              // LLVM_DEBUG(dbgs() << "@@ end second try\n");
               if (!Res) {
                 NonSchedulable
                     .try_emplace(Slice.front(), std::make_pair(Size, Size))

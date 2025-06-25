@@ -305,7 +305,11 @@ void InsertIntoBB::dump() const {
 }
 #endif
 
-void CreateAndInsertInst::revert(Tracker &Tracker) { NewI->eraseFromParent(); }
+void CreateAndInsertInst::revert(Tracker &Tracker) { 
+  // NewI->dump();
+  // dbgs() << "@@\n";
+  NewI->eraseFromParent(); 
+}
 
 #ifndef NDEBUG
 void CreateAndInsertInst::dump() const {
