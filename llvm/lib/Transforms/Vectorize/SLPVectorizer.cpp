@@ -6179,8 +6179,9 @@ static Value *SBcreateInsertVector(
   const unsigned SubVecVF = getNumElements(V->getType());
   // sandboxir::InsertPosition SBIP = getSBInsertPosition(Builder, Ctx);
   if (Index % SubVecVF == 0) {
-    Vec = Builder.CreateInsertVector(Vec->getType(), Vec, V,
-                                     Builder.getInt64(Index));
+    Value *Lane = Builder.getInt64(Index);
+    Ctx.registerCreatedValue(Lane);
+    Vec = Builder.CreateInsertVector(Vec->getType(), Vec, V, Lane);
     // llvm::CallInst *CI = llvm::dyn_cast<llvm::CallInst>(Vec);
     // Ctx.createCallInst(CI);
     Ctx.registerCreatedValue(Vec);
@@ -6251,7 +6252,9 @@ static Value *SBcreateExtractVector(IRBuilderBase &Builder, Value *Vec,
   if (Index % SubVecVF == 0) {
     VectorType *SubVecTy =
         getWidenedType(Vec->getType()->getScalarType(), SubVecVF);
-    Value *Ex = Builder.CreateExtractVector(SubVecTy, Vec, Builder.getInt64(Index));
+    Value *Lane = Builder.getInt64(Index);
+    Ctx.registerCreatedValue(Lane);
+    Value *Ex = Builder.CreateExtractVector(SubVecTy, Vec, Lane);
     // sandboxir::CallInst *CI = dyn_cast<CallInst>(Ex);
     // Ctx.createCallInst(CI);
     Ctx.registerCreatedValue(Ex);
@@ -16778,7 +16781,9 @@ Value *BoUpSLP::SBgather(
         return Vec;
       InsElt = II;
     } else {
-      Vec = Builder.CreateInsertElement(Vec, Scalar, Builder.getInt32(Pos));
+      Value *Lane = Builder.getInt32(Pos);
+      Ctx.registerCreatedValue(Lane);
+      Vec = Builder.CreateInsertElement(Vec, Scalar, Lane);
       // if (auto *svi = dyn_cast<InsertElementInst>(Vec)) 
       //   Ctx.createInsertElementInst(svi);
       // else if (auto *c = dyn_cast<Constant>(Vec)) 
@@ -21623,11 +21628,13 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
           Ctx.registerCreatedValue(StrideVal);
         }
         Align CommonAlignment = computeCommonAlignment<LoadInst>(E->Scalars);
+        Value *LaneSB = Builder.getInt32(E->Scalars.size());
+        Ctx.registerCreatedValue(LaneSB);
         auto *Inst = Builder.CreateIntrinsic(
             Intrinsic::experimental_vp_strided_load,
             {VecTy, PO->getType(), StrideTy},
             {PO, StrideVal, Builder.getAllOnesMask(VecTy->getElementCount()),
-             Builder.getInt32(E->Scalars.size())});
+             LaneSB});
         // for sandboxir
         // if (auto *calli = dyn_cast<CallInst>(Inst)) 
         //   Ctx.createCallInst(calli);
@@ -21653,8 +21660,10 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
                  "Cannot expand getelementptr.");
           unsigned VF = VecTyNumElements / ScalarTyNumElements;
           SmallVector<Constant *> Indices(VecTyNumElements);
-          transform(seq(VecTyNumElements), Indices.begin(), [=](unsigned I) {
-            return Builder.getInt64(I % ScalarTyNumElements);
+          transform(seq(VecTyNumElements), Indices.begin(), [=, &Ctx](unsigned I) {
+            ConstantInt *Lane = Builder.getInt64(I % ScalarTyNumElements);
+            Ctx.registerCreatedValue(Lane);
+            return Lane;
           });
           Value *tempshuffle = Builder.CreateShuffleVector(
                   VecPtr, createReplicatedMask(ScalarTyNumElements, VF));
@@ -21731,6 +21740,8 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
         }
         Align CommonAlignment = computeCommonAlignment<StoreInst>(E->Scalars);
         Type *StrideTy = DL->getIndexType(SI->getPointerOperandType());
+        Value *LaneSB = Builder.getInt32(E->Scalars.size());
+        Ctx.registerCreatedValue(LaneSB);
         auto *Inst = Builder.CreateIntrinsic(
             Intrinsic::experimental_vp_strided_store,
             {VecTy, Ptr->getType(), StrideTy},
@@ -21738,7 +21749,7 @@ Value *BoUpSLP::SBvectorizeTree(TreeEntry *E, sandboxir::Context &Ctx) {
              ConstantInt::get(
                  StrideTy, -static_cast<int>(DL->getTypeAllocSize(ScalarTy))),
              Builder.getAllOnesMask(VecTy->getElementCount()),
-             Builder.getInt32(E->Scalars.size())});
+             LaneSB});
         // for sandboxir
         // if (auto *calli = dyn_cast<CallInst>(Inst)) 
         //   Ctx.createCallInst(calli);
