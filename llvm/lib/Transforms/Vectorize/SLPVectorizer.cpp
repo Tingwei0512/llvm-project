@@ -3523,7 +3523,6 @@ public:
       // I->removeFromParent();
       // Do it in a sandboxir way
       sandboxir::Instruction *SBI = cast<sandboxir::Instruction>(Ctx.getValue(I));
-      // LLVM_DEBUG(dbgs() << "@@SLP11 "<< ".\n");
       SBI->removeFromParent();
       SE->forgetValue(I);
     }
@@ -6150,6 +6149,7 @@ static Value *createInsertVector(
     function_ref<Value *(Value *, Value *, ArrayRef<int>)> Generator = {}) {
   const unsigned SubVecVF = getNumElements(V->getType());
   if (Index % SubVecVF == 0) {
+    LLVM_DEBUG(dbgs() << "@@ get here insertvector\n");
     Vec = Builder.CreateInsertVector(Vec->getType(), Vec, V,
                                      Builder.getInt64(Index));
   } else {
@@ -6237,6 +6237,7 @@ static Value *createExtractVector(IRBuilderBase &Builder, Value *Vec,
   if (Index % SubVecVF == 0) {
     VectorType *SubVecTy =
         getWidenedType(Vec->getType()->getScalarType(), SubVecVF);
+    LLVM_DEBUG(dbgs() << "@@ get here extractvector\n");
     return Builder.CreateExtractVector(SubVecTy, Vec, Builder.getInt64(Index));
   }
   // Create shuffle, extract_subvector requires that index is multiple of
@@ -16784,12 +16785,6 @@ Value *BoUpSLP::SBgather(
       Value *Lane = Builder.getInt32(Pos);
       Ctx.registerCreatedValue(Lane);
       Vec = Builder.CreateInsertElement(Vec, Scalar, Lane);
-      // if (auto *svi = dyn_cast<InsertElementInst>(Vec)) 
-      //   Ctx.createInsertElementInst(svi);
-      // else if (auto *c = dyn_cast<Constant>(Vec)) 
-      //   Ctx.getOrCreateConstant(c);
-      // else 
-      //   llvm_unreachable("Unhandled V type!");
       Ctx.registerCreatedValue(Vec);
       InsElt = dyn_cast<InsertElementInst>(Vec);
       if (!InsElt)
@@ -22337,6 +22332,7 @@ Value *BoUpSLP::vectorizeTree(
 
     Value *Lane = Builder.getInt32(ExternalUse.Lane);
     auto ExtractAndExtendIfNeeded = [&](Value *Vec) {
+      LLVM_DEBUG(dbgs() << "@@ get here extractandextendifneeded\n");
       if (Scalar->getType() != Vec->getType()) {
         Value *Ex = nullptr;
         Value *ExV = nullptr;
@@ -23218,6 +23214,7 @@ Value *BoUpSLP::SBvectorizeTree(
                 !IV || IV == Vec || IV->getParent() != IVec->getParent() ||
                 IV->comesBefore(IVec)) {
                   Ex = Builder.CreateExtractElement(V, ES->getIndexOperand());
+              LLVM_DEBUG(dbgs() << "@@ get here extractelement2\n");
               // for sandboxir
               // if (auto *svi = dyn_cast<ExtractElementInst>(Ex)) 
               //   Ctx.createExtractElementInst(svi);
@@ -25977,6 +25974,18 @@ bool SLPVectorizerPass::vectorizeStores(
                               const std::pair<unsigned, unsigned> &P) {
         return Size == P.first;
       };
+      ///////////////////////////////// Save States /////////////////////////////
+      BoUpSLP::StateSnapshot SS(R);
+      Ctx.save();
+      BoUpSLP::ValueSet VectorizedStoresSS = VectorizedStores;
+      bool ChangedSS = Changed;
+      SmallVector<unsigned> CandidateVFsSS = CandidateVFs;
+      OwningArrayRef<std::pair<unsigned, unsigned>> RangeSizes_backup(Operands.size());
+      std::copy(RangeSizes.begin(), RangeSizes.end(), RangeSizes_backup.begin());
+      DenseMap<Value *, std::pair<unsigned, unsigned>> NonSchedulableSS = NonSchedulable;
+      unsigned EndSS = End;
+      unsigned RepeatSS = Repeat;
+      ///////////////////////////////// Save States /////////////////////////////
       while (true) {
         ++Repeat;
         bool RepeatChanged = false;
@@ -26019,24 +26028,16 @@ bool SLPVectorizerPass::vectorizeStores(
                 }
               }
               unsigned TreeSize;
-              BoUpSLP::StateSnapshot SS(R);//
-              // R.iterateOverInstructionsandregister(Ctx);
-              Ctx.save();//
+              // BoUpSLP::StateSnapshot SS(R);
+              // Ctx.save();
               // LLVM_DEBUG(dbgs() << "@@ first try\n");
-              // LLVM_DEBUG(dbgs() << "@@SLP: ir dump before---------------------------------------\n");
               std::optional<bool> Res =
                   vectorizeStoreChain(Slice, R, Cnt, MinVF, TreeSize, Ctx);
-              // LLVM_DEBUG(dbgs() << "@@SLP: ir dump after stores---------------------------------\n");
-              // R.iterateOverInstructions(Ctx);
-              // LLVM_DEBUG(dbgs() << "@@SLP: ir tracker dump---------------------------------\n");
-              // Ctx.getTracker().dump();
-              Ctx.revert();//
-              R.restoreState(SS);
-              // LLVM_DEBUG(dbgs() << "@@SLP: ir dump reverted-------------------------------------\n");
-              // R.iterateOverInstructions(Ctx);
+              // Ctx.revert();
+              // R.restoreState(SS);
               // LLVM_DEBUG(dbgs() << "@@ reverted\n");
-              Res =//
-                  vectorizeStoreChain(Slice, R, Cnt, MinVF, TreeSize, Ctx);//
+              // Res =
+              //     vectorizeStoreChain(Slice, R, Cnt, MinVF, TreeSize, Ctx);
               // LLVM_DEBUG(dbgs() << "@@ end second try\n");
               if (!Res) {
                 NonSchedulable
@@ -26146,6 +26147,179 @@ bool SLPVectorizerPass::vectorizeStores(
         // attempts were unsuccessful because of the cost issues.
         CandidateVFs.push_back(VF);
       }
+      ///////////////////////////////// Restore States /////////////////////////////
+      R.restoreState(SS);
+      Ctx.revert();
+      VectorizedStores = VectorizedStoresSS;
+      Changed = ChangedSS;
+      CandidateVFs = CandidateVFsSS;
+      std::copy(RangeSizes_backup.begin(), RangeSizes_backup.end(), RangeSizes.begin());
+      NonSchedulable = NonSchedulableSS;
+      End = EndSS;
+      Repeat = RepeatSS;
+      ///////////////////////////////// Restore States /////////////////////////////
+      while (true) {
+        ++Repeat;
+        bool RepeatChanged = false;
+        bool AnyProfitableGraph = false;
+        for (unsigned Size : CandidateVFs) {
+          AnyProfitableGraph = false;
+          unsigned StartIdx = std::distance(
+              RangeSizes.begin(),
+              find_if(RangeSizes,
+                      std::bind(IsNotVectorized, Size >= MaxRegVF, _1)));
+          while (StartIdx < End) {
+            unsigned EndIdx = std::distance(
+                RangeSizes.begin(),
+                find_if(RangeSizes.drop_front(StartIdx),
+                        std::bind(IsVectorized, Size >= MaxRegVF, _1)));
+            unsigned Sz = EndIdx >= End ? End : EndIdx;
+            for (unsigned Cnt = StartIdx; Cnt + Size <= Sz;) {
+              if (!checkTreeSizes(RangeSizes.slice(Cnt, Size),
+                                  Size >= MaxRegVF)) {
+                ++Cnt;
+                continue;
+              }
+              ArrayRef<Value *> Slice = ArrayRef(Operands).slice(Cnt, Size);
+              assert(all_of(Slice,
+                            [&](Value *V) {
+                              return cast<StoreInst>(V)
+                                         ->getValueOperand()
+                                         ->getType() ==
+                                     cast<StoreInst>(Slice.front())
+                                         ->getValueOperand()
+                                         ->getType();
+                            }) &&
+                     "Expected all operands of same type.");
+              if (!NonSchedulable.empty()) {
+                auto [NonSchedSizeMax, NonSchedSizeMin] =
+                    NonSchedulable.lookup(Slice.front());
+                if (NonSchedSizeMax > 0 && NonSchedSizeMin <= Size) {
+                  Cnt += NonSchedSizeMax;
+                  continue;
+                }
+              }
+              unsigned TreeSize;
+              // BoUpSLP::StateSnapshot SS(R);
+              // Ctx.save();
+              // LLVM_DEBUG(dbgs() << "@@ first try\n");
+              std::optional<bool> Res =
+                  vectorizeStoreChain(Slice, R, Cnt, MinVF, TreeSize, Ctx);
+              // Ctx.revert();
+              // R.restoreState(SS);
+              // LLVM_DEBUG(dbgs() << "@@ reverted\n");
+              // Res =
+              //     vectorizeStoreChain(Slice, R, Cnt, MinVF, TreeSize, Ctx);
+              // LLVM_DEBUG(dbgs() << "@@ end second try\n");
+              if (!Res) {
+                NonSchedulable
+                    .try_emplace(Slice.front(), std::make_pair(Size, Size))
+                    .first->getSecond()
+                    .second = Size;
+              } else if (*Res) {
+                // Mark the vectorized stores so that we don't vectorize them
+                // again.
+                VectorizedStores.insert_range(Slice);
+                // Mark the vectorized stores so that we don't vectorize them
+                // again.
+                AnyProfitableGraph = RepeatChanged = Changed = true;
+                // If we vectorized initial block, no need to try to vectorize
+                // it again.
+                for (std::pair<unsigned, unsigned> &P :
+                     RangeSizes.slice(Cnt, Size))
+                  P.first = P.second = 0;
+                if (Cnt < StartIdx + MinVF) {
+                  for (std::pair<unsigned, unsigned> &P :
+                       RangeSizes.slice(StartIdx, Cnt - StartIdx))
+                    P.first = P.second = 0;
+                  StartIdx = Cnt + Size;
+                }
+                if (Cnt > Sz - Size - MinVF) {
+                  for (std::pair<unsigned, unsigned> &P :
+                       RangeSizes.slice(Cnt + Size, Sz - (Cnt + Size)))
+                    P.first = P.second = 0;
+                  if (Sz == End)
+                    End = Cnt;
+                  Sz = Cnt;
+                }
+                Cnt += Size;
+                continue;
+              }
+              if (Size > 2 && Res &&
+                  !all_of(RangeSizes.slice(Cnt, Size),
+                          std::bind(VFIsProfitable, Size >= MaxRegVF, TreeSize,
+                                    _1))) {
+                Cnt += Size;
+                continue;
+              }
+              // Check for the very big VFs that we're not rebuilding same
+              // trees, just with larger number of elements.
+              if (Size > MaxRegVF && TreeSize > 1 &&
+                  all_of(RangeSizes.slice(Cnt, Size),
+                         std::bind(FirstSizeSame, TreeSize, _1))) {
+                Cnt += Size;
+                while (Cnt != Sz && RangeSizes[Cnt].first == TreeSize)
+                  ++Cnt;
+                continue;
+              }
+              if (TreeSize > 1)
+                for (std::pair<unsigned, unsigned> &P :
+                     RangeSizes.slice(Cnt, Size)) {
+                  if (Size >= MaxRegVF)
+                    P.second = std::max(P.second, TreeSize);
+                  else
+                    P.first = std::max(P.first, TreeSize);
+                }
+              ++Cnt;
+              AnyProfitableGraph = true;
+            }
+            if (StartIdx >= End)
+              break;
+            if (Sz - StartIdx < Size && Sz - StartIdx >= MinVF)
+              AnyProfitableGraph = true;
+            StartIdx = std::distance(
+                RangeSizes.begin(),
+                find_if(RangeSizes.drop_front(Sz),
+                        std::bind(IsNotVectorized, Size >= MaxRegVF, _1)));
+          }
+          if (!AnyProfitableGraph && Size >= MaxRegVF && has_single_bit(Size))
+            break;
+        }
+        // All values vectorized - exit.
+        if (all_of(RangeSizes, [](const std::pair<unsigned, unsigned> &P) {
+              return P.first == 0 && P.second == 0;
+            }))
+          break;
+        // Check if tried all attempts or no need for the last attempts at all.
+        if (Repeat >= MaxAttempts ||
+            (Repeat > 1 && (RepeatChanged || !AnyProfitableGraph)))
+          break;
+        constexpr unsigned StoresLimit = 64;
+        const unsigned MaxTotalNum = std::min<unsigned>(
+            Operands.size(),
+            static_cast<unsigned>(
+                End -
+                std::distance(
+                    RangeSizes.begin(),
+                    find_if(RangeSizes, std::bind(IsNotVectorized, true, _1))) +
+                1));
+        unsigned VF = bit_ceil(CandidateVFs.front()) * 2;
+        unsigned Limit =
+            getFloorFullVectorNumberOfElements(*TTI, StoreTy, MaxTotalNum);
+        CandidateVFs.clear();
+        if (bit_floor(Limit) == VF)
+          CandidateVFs.push_back(Limit);
+        if (VF > MaxTotalNum || VF >= StoresLimit)
+          break;
+        for (std::pair<unsigned, unsigned> &P : RangeSizes) {
+          if (P.first != 0)
+            P.first = std::max(P.second, P.first);
+        }
+        // Last attempt to vectorize max number of elements, if all previous
+        // attempts were unsuccessful because of the cost issues.
+        CandidateVFs.push_back(VF);
+      }
+      
     }
   };
 

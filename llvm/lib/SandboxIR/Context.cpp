@@ -795,6 +795,7 @@ Instruction *Context::registerInstruction(llvm::Instruction *I) {
   case llvm::Instruction::Select:
     return createSelectInst(cast<llvm::SelectInst>(I));
   case llvm::Instruction::ExtractElement:
+    registerCreatedValue(dyn_cast<llvm::ExtractElementInst>(I)->getIndexOperand());
     return createExtractElementInst(cast<llvm::ExtractElementInst>(I));
   case llvm::Instruction::InsertElement:
     return createInsertElementInst(cast<llvm::InsertElementInst>(I));
@@ -895,18 +896,10 @@ Instruction *Context::registerInstruction(llvm::Instruction *I) {
 }
 
 Value *Context::registerCreatedValue(llvm::Value *V) {
-  // First, check if V is an instruction.
-  if (auto *I = dyn_cast<llvm::Instruction>(V)) {
-    // If so, call registerInstruction to ensure its creation is tracked.
+  if (auto *I = dyn_cast<llvm::Instruction>(V)) 
     return registerInstruction(I);
-  }
-  // If not, check if it's a constant (due to constant folding).
-  if (auto *C = dyn_cast<llvm::Constant>(V)) {
-    // If so, get or create the wrapper for the constant.
+  if (auto *C = dyn_cast<llvm::Constant>(V)) 
     return getOrCreateConstant(C);
-  }
-  // If the value is neither an instruction nor a constant, it's an
-  // unexpected type resulting from an instruction-creation-like call.
   llvm_unreachable(
       "Unhandled value type in registerCreatedValue. Expected "
       "Instruction or Constant.");
