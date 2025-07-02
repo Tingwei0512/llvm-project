@@ -108,6 +108,7 @@
 #include <string>
 #include <tuple>
 #include <utility>
+#include <stack>
 
 using namespace llvm;
 using namespace llvm::PatternMatch;
@@ -8304,7 +8305,7 @@ Instruction *BoUpSLP::getRootEntryInstruction(const TreeEntry &Entry) const {
     return dyn_cast<Instruction>(Entry.Scalars[Entry.ReorderIndices.front()]);
   return dyn_cast<Instruction>(Entry.Scalars.front());
 }
-
+uint64_t num_externalUsers = 0;
 void BoUpSLP::buildExternalUses(
     const ExtraValueToDebugLocsMap &ExternallyUsedValues) {
   DenseMap<Value *, unsigned> ScalarToExtUses;
@@ -8388,6 +8389,7 @@ void BoUpSLP::buildExternalUses(
       }
     }
   }
+  num_externalUsers = ExternalUses.size();
 }
 
 SmallVector<SmallVector<StoreInst *>>
@@ -25625,13 +25627,14 @@ bool SLPVectorizerPass::runImpl(Function &F, ScalarEvolution *SE_,
   }
   return Changed;
 }
-
+InstructionCost sliceCost;
 std::optional<bool>
 SLPVectorizerPass::vectorizeStoreChain(ArrayRef<Value *> Chain, BoUpSLP &R,
                                        unsigned Idx, unsigned MinVF,
-                                       unsigned &Size, sandboxir::Context& Ctx) {
+                                       unsigned &Size, bool test, sandboxir::Context& Ctx) {
   // LLVM_DEBUG(dbgs() << "**1: \n");
   // R.iterateOverInstructions(Ctx);
+  sliceCost = 0;
   Size = 0;
   LLVM_DEBUG(dbgs() << "SLP: Analyzing a store chain of length " << Chain.size()
                     << "\n");
@@ -25715,24 +25718,27 @@ SLPVectorizerPass::vectorizeStoreChain(ArrayRef<Value *> Chain, BoUpSLP &R,
   if (S && S.getOpcode() == Instruction::Load)
     Size = 2; // cut off masked gather small trees
   InstructionCost Cost = R.getTreeCost();
+  sliceCost = Cost;
   // LLVM_DEBUG(dbgs() << "**8: \n");
   // R.iterateOverInstructions(Ctx);
   LLVM_DEBUG(dbgs() << "SLP: Found cost = " << Cost << " for VF=" << VF << "\n");
   if (Cost < -SLPCostThreshold) {
     LLVM_DEBUG(dbgs() << "SLP: Decided to vectorize cost = " << Cost << "\n");
+    if (!test) {
+      using namespace ore;
 
-    using namespace ore;
-
-    R.getORE()->emit(OptimizationRemark(SV_NAME, "StoresVectorized",
-                                        cast<StoreInst>(Chain[0]))
-                     << "Stores SLP vectorized with cost " << NV("Cost", Cost)
-                     << " and with tree size "
-                     << NV("TreeSize", R.getTreeSize()));
-    // LLVM_DEBUG(dbgs() << "@@SLP: vectorizing tree\n");
-    // R.iterateOverInstructions(Ctx);
-    R.SBvectorizeTree(Ctx);
-    // LLVM_DEBUG(dbgs() << "@@SLP: vectorized tree\n");
-    // R.iterateOverInstructions(Ctx);
+      R.getORE()->emit(OptimizationRemark(SV_NAME, "StoresVectorized",
+                                          cast<StoreInst>(Chain[0]))
+                      << "Stores SLP vectorized with cost " << NV("Cost", Cost)
+                      << " and with tree size "
+                      << NV("TreeSize", R.getTreeSize()));
+      // LLVM_DEBUG(dbgs() << "@@SLP: vectorizing tree\n");
+      // R.iterateOverInstructions(Ctx);
+      R.SBvectorizeTree(Ctx);
+      // LLVM_DEBUG(dbgs() << "@@SLP: vectorized tree\n");
+      // R.iterateOverInstructions(Ctx);
+    }
+    
     return true;
   }
 
@@ -25974,355 +25980,1148 @@ bool SLPVectorizerPass::vectorizeStores(
                               const std::pair<unsigned, unsigned> &P) {
         return Size == P.first;
       };
-      ///////////////////////////////// Save States /////////////////////////////
-      BoUpSLP::StateSnapshot SS(R);
-      Ctx.save();
-      BoUpSLP::ValueSet VectorizedStoresSS = VectorizedStores;
-      bool ChangedSS = Changed;
       SmallVector<unsigned> CandidateVFsSS = CandidateVFs;
-      OwningArrayRef<std::pair<unsigned, unsigned>> RangeSizes_backup(Operands.size());
-      std::copy(RangeSizes.begin(), RangeSizes.end(), RangeSizes_backup.begin());
-      DenseMap<Value *, std::pair<unsigned, unsigned>> NonSchedulableSS = NonSchedulable;
-      unsigned EndSS = End;
-      unsigned RepeatSS = Repeat;
-      ///////////////////////////////// Save States /////////////////////////////
-      while (true) {
-        ++Repeat;
-        bool RepeatChanged = false;
-        bool AnyProfitableGraph = false;
-        for (unsigned Size : CandidateVFs) {
-          AnyProfitableGraph = false;
-          unsigned StartIdx = std::distance(
-              RangeSizes.begin(),
-              find_if(RangeSizes,
-                      std::bind(IsNotVectorized, Size >= MaxRegVF, _1)));
-          while (StartIdx < End) {
-            unsigned EndIdx = std::distance(
-                RangeSizes.begin(),
-                find_if(RangeSizes.drop_front(StartIdx),
-                        std::bind(IsVectorized, Size >= MaxRegVF, _1)));
-            unsigned Sz = EndIdx >= End ? End : EndIdx;
-            for (unsigned Cnt = StartIdx; Cnt + Size <= Sz;) {
-              if (!checkTreeSizes(RangeSizes.slice(Cnt, Size),
-                                  Size >= MaxRegVF)) {
-                ++Cnt;
-                continue;
-              }
-              ArrayRef<Value *> Slice = ArrayRef(Operands).slice(Cnt, Size);
-              assert(all_of(Slice,
-                            [&](Value *V) {
-                              return cast<StoreInst>(V)
-                                         ->getValueOperand()
-                                         ->getType() ==
-                                     cast<StoreInst>(Slice.front())
-                                         ->getValueOperand()
-                                         ->getType();
-                            }) &&
-                     "Expected all operands of same type.");
-              if (!NonSchedulable.empty()) {
-                auto [NonSchedSizeMax, NonSchedSizeMin] =
-                    NonSchedulable.lookup(Slice.front());
-                if (NonSchedSizeMax > 0 && NonSchedSizeMin <= Size) {
-                  Cnt += NonSchedSizeMax;
-                  continue;
-                }
-              }
-              unsigned TreeSize;
-              // BoUpSLP::StateSnapshot SS(R);
-              // Ctx.save();
-              // LLVM_DEBUG(dbgs() << "@@ first try\n");
-              std::optional<bool> Res =
-                  vectorizeStoreChain(Slice, R, Cnt, MinVF, TreeSize, Ctx);
-              // Ctx.revert();
-              // R.restoreState(SS);
-              // LLVM_DEBUG(dbgs() << "@@ reverted\n");
-              // Res =
-              //     vectorizeStoreChain(Slice, R, Cnt, MinVF, TreeSize, Ctx);
-              // LLVM_DEBUG(dbgs() << "@@ end second try\n");
-              if (!Res) {
-                NonSchedulable
-                    .try_emplace(Slice.front(), std::make_pair(Size, Size))
-                    .first->getSecond()
-                    .second = Size;
-              } else if (*Res) {
-                // Mark the vectorized stores so that we don't vectorize them
-                // again.
-                VectorizedStores.insert_range(Slice);
-                // Mark the vectorized stores so that we don't vectorize them
-                // again.
-                AnyProfitableGraph = RepeatChanged = Changed = true;
-                // If we vectorized initial block, no need to try to vectorize
-                // it again.
-                for (std::pair<unsigned, unsigned> &P :
-                     RangeSizes.slice(Cnt, Size))
-                  P.first = P.second = 0;
-                if (Cnt < StartIdx + MinVF) {
-                  for (std::pair<unsigned, unsigned> &P :
-                       RangeSizes.slice(StartIdx, Cnt - StartIdx))
-                    P.first = P.second = 0;
-                  StartIdx = Cnt + Size;
-                }
-                if (Cnt > Sz - Size - MinVF) {
-                  for (std::pair<unsigned, unsigned> &P :
-                       RangeSizes.slice(Cnt + Size, Sz - (Cnt + Size)))
-                    P.first = P.second = 0;
-                  if (Sz == End)
-                    End = Cnt;
-                  Sz = Cnt;
-                }
-                Cnt += Size;
-                continue;
-              }
-              if (Size > 2 && Res &&
-                  !all_of(RangeSizes.slice(Cnt, Size),
-                          std::bind(VFIsProfitable, Size >= MaxRegVF, TreeSize,
-                                    _1))) {
-                Cnt += Size;
-                continue;
-              }
-              // Check for the very big VFs that we're not rebuilding same
-              // trees, just with larger number of elements.
-              if (Size > MaxRegVF && TreeSize > 1 &&
-                  all_of(RangeSizes.slice(Cnt, Size),
-                         std::bind(FirstSizeSame, TreeSize, _1))) {
-                Cnt += Size;
-                while (Cnt != Sz && RangeSizes[Cnt].first == TreeSize)
-                  ++Cnt;
-                continue;
-              }
-              if (TreeSize > 1)
-                for (std::pair<unsigned, unsigned> &P :
-                     RangeSizes.slice(Cnt, Size)) {
-                  if (Size >= MaxRegVF)
-                    P.second = std::max(P.second, TreeSize);
-                  else
-                    P.first = std::max(P.first, TreeSize);
-                }
-              ++Cnt;
-              AnyProfitableGraph = true;
-            }
-            if (StartIdx >= End)
-              break;
-            if (Sz - StartIdx < Size && Sz - StartIdx >= MinVF)
-              AnyProfitableGraph = true;
-            StartIdx = std::distance(
-                RangeSizes.begin(),
-                find_if(RangeSizes.drop_front(Sz),
-                        std::bind(IsNotVectorized, Size >= MaxRegVF, _1)));
+      /// Finding real optimal slice selection via rollback.
+      struct SliceInfo {
+        unsigned StartIdx;
+        unsigned Length;
+        unsigned VF;
+        InstructionCost Cost;
+        
+        SliceInfo(unsigned Start, unsigned Len, unsigned VecFactor, InstructionCost C)
+          : StartIdx(Start), Length(Len), VF(VecFactor), Cost(C) {}
+      };
+
+      struct SequenceInfo {
+        std::vector<SliceInfo> PreviousPath;
+        SliceInfo CurrentSlice;
+        InstructionCost TotalCost;
+        std::vector<std::pair<unsigned, unsigned>> RangeSizes;  // 模擬原始 RangeSizes
+        
+        SequenceInfo(const std::vector<SliceInfo>& Path, const SliceInfo& Slice, 
+                    InstructionCost Cost, const std::vector<std::pair<unsigned, unsigned>>& Ranges)
+          : PreviousPath(Path), CurrentSlice(Slice), TotalCost(Cost), RangeSizes(std::move(Ranges)) {
+          // 深拷貝 RangeSizes
+          std::copy(Ranges.begin(), Ranges.end(), RangeSizes.begin());
+        }
+      };
+
+      // 檢查切片是否可以向量化（基於 RangeSizes）
+      auto CanVectorizeSlice = [&](unsigned StartIdx, unsigned Size, unsigned MaxRegVF,
+                                  const std::vector<std::pair<unsigned, unsigned>>& RangeSizes) -> bool {
+        
+        // 檢查切片中的所有元素是否都沒有被向量化
+        for (unsigned i = StartIdx; i < StartIdx + Size; i++) {
+          if (IsVectorized(Size >= MaxRegVF, RangeSizes[i])) {
+            return false;  // 已經被向量化了
           }
-          if (!AnyProfitableGraph && Size >= MaxRegVF && has_single_bit(Size))
-            break;
         }
-        // All values vectorized - exit.
-        if (all_of(RangeSizes, [](const std::pair<unsigned, unsigned> &P) {
-              return P.first == 0 && P.second == 0;
-            }))
-          break;
-        // Check if tried all attempts or no need for the last attempts at all.
-        if (Repeat >= MaxAttempts ||
-            (Repeat > 1 && (RepeatChanged || !AnyProfitableGraph)))
-          break;
-        constexpr unsigned StoresLimit = 64;
-        const unsigned MaxTotalNum = std::min<unsigned>(
-            Operands.size(),
-            static_cast<unsigned>(
-                End -
-                std::distance(
-                    RangeSizes.begin(),
-                    find_if(RangeSizes, std::bind(IsNotVectorized, true, _1))) +
-                1));
-        unsigned VF = bit_ceil(CandidateVFs.front()) * 2;
-        unsigned Limit =
-            getFloorFullVectorNumberOfElements(*TTI, StoreTy, MaxTotalNum);
-        CandidateVFs.clear();
-        if (bit_floor(Limit) == VF)
-          CandidateVFs.push_back(Limit);
-        if (VF > MaxTotalNum || VF >= StoresLimit)
-          break;
-        for (std::pair<unsigned, unsigned> &P : RangeSizes) {
-          if (P.first != 0)
-            P.first = std::max(P.second, P.first);
+        
+        // 使用原始的 checkTreeSizes 邏輯
+        ArrayRef<std::pair<unsigned, unsigned>> SubRange(RangeSizes.data() + StartIdx, Size);
+        return checkTreeSizes(SubRange, Size >= MaxRegVF);
+        // diable checkTreeSizes for now
+        // return true;
+      };
+
+      // 更新 RangeSizes 當一個切片被向量化後
+      auto UpdateRangeSizesAfterVectorization = [&](unsigned StartIdx, unsigned Size, unsigned MaxRegVF,
+                                                    std::vector<std::pair<unsigned, unsigned>>& RangeSizes) {
+        // 模擬原始代碼中向量化成功後的 RangeSizes 更新邏輯
+        // for (std::pair<unsigned, unsigned> &P : RangeSizes.slice(StartIdx, Size)) {
+        //   P.first = P.second = 0;  // 標記為已向量化
+        // }
+        for (unsigned i = StartIdx; i < StartIdx + Size; i++) {
+          RangeSizes[i].first = RangeSizes[i].second = 0;
         }
-        // Last attempt to vectorize max number of elements, if all previous
-        // attempts were unsuccessful because of the cost issues.
-        CandidateVFs.push_back(VF);
+      };
+
+      // 計算外部使用表的修正版本
+      auto CalculateExternalUses = [&](const std::vector<std::pair<unsigned, unsigned>>& RangeSizes) 
+        -> std::vector<std::vector<uint64_t>> {
+        
+        unsigned OperandsSize = Operands.size();
+        std::vector<std::vector<uint64_t>> ExtUsers(OperandsSize, 
+                                                    std::vector<uint64_t>(OperandsSize, 0));
+        
+        for (unsigned Size : CandidateVFs) {
+          for (unsigned StartIdx = 0; StartIdx + Size <= OperandsSize; StartIdx++) {
+            
+            // 使用 RangeSizes 檢查而不是簡單的 boolean 陣列
+            if (!CanVectorizeSlice(StartIdx, Size, MaxRegVF, RangeSizes)) {
+              continue;
+            }
+            
+            unsigned EndIdx = StartIdx + Size - 1;
+            ArrayRef<Value *> Slice = ArrayRef(Operands).slice(StartIdx, Size);
+            
+            unsigned TreeSize;
+            std::optional<bool> Res = vectorizeStoreChain(Slice, R, StartIdx, MinVF, TreeSize, true, Ctx);
+            if (Res && *Res) {
+              ExtUsers[StartIdx][EndIdx] = num_externalUsers;
+            }
+          }
+        }
+        
+        return ExtUsers;
+      };
+
+      auto RunDPOnRemaining = [&](const std::vector<std::pair<unsigned, unsigned>>& CurrentRangeSizes, 
+                            InstructionCost BaselineCost) 
+        -> std::pair<InstructionCost, std::vector<SliceInfo>> {
+        
+        unsigned OperandsSize = Operands.size();
+        
+        // 找到所有未向量化的連續區間
+        std::vector<std::pair<unsigned, unsigned>> UnvectorizedRanges;
+        unsigned Start = 0;
+        
+        while (Start < OperandsSize) {
+          // 找到下一個未向量化的位置
+          while (Start < OperandsSize && IsVectorized(true, CurrentRangeSizes[Start])) {
+            Start++;
+          }
+          if (Start >= OperandsSize) break;
+          
+          // 找到連續未向量化區間的結束
+          unsigned End = Start;
+          while (End < OperandsSize && IsNotVectorized(true, CurrentRangeSizes[End])) {
+            End++;
+          }
+          
+          if (End > Start) {
+            UnvectorizedRanges.push_back({Start, End - 1});
+          }
+          Start = End;
+        }
+        
+        std::vector<SliceInfo> BestDPPath;
+        InstructionCost TotalDPCost = BaselineCost;
+        
+        // 對每個未向量化的連續區間分別執行 DP
+        for (const auto& Range : UnvectorizedRanges) {
+          unsigned RangeStart = Range.first;
+          unsigned RangeEnd = Range.second;
+          unsigned RangeSize = RangeEnd - RangeStart + 1;
+          
+          if (RangeSize < 2) continue; // 太小無法向量化
+          
+          // 計算這個區間內所有可能切片的成本
+          std::vector<std::vector<InstructionCost>> DPCosts(RangeSize, 
+                                                            std::vector<InstructionCost>(RangeSize, InstructionCost::getInvalid()));
+          std::vector<std::vector<unsigned>> DPTreeSizes(RangeSize, 
+                                                        std::vector<unsigned>(RangeSize, 0));
+          
+          for (unsigned Size : CandidateVFs) {
+            if (Size > RangeSize) continue;
+            
+            for (unsigned i = 0; i + Size <= RangeSize; i++) {
+              unsigned j = i + Size - 1;
+              unsigned OrigStartIdx = RangeStart + i;
+              
+              // 檢查這個切片是否可以向量化
+              // 手動創建 ArrayRef 而不是使用 slice()
+              ArrayRef<std::pair<unsigned, unsigned>> SubRange(CurrentRangeSizes.data() + OrigStartIdx, Size);
+              if (!checkTreeSizes(SubRange, Size >= MaxRegVF)) {
+                continue;
+              }
+              
+              ArrayRef<Value *> Slice = ArrayRef(Operands).slice(OrigStartIdx, Size);
+              unsigned TreeSize;
+              std::optional<bool> Res = vectorizeStoreChain(Slice, R, OrigStartIdx, MinVF, TreeSize, true, Ctx);
+              if (Res && *Res) {
+                DPCosts[i][j] = sliceCost;
+                DPTreeSizes[i][j] = TreeSize;
+              }
+            }
+          }
+          
+          // 執行 DP 並追踪路徑
+          std::vector<InstructionCost> DP(RangeSize, InstructionCost::getMax());
+          std::vector<std::vector<SliceInfo>> DPPaths(RangeSize);
+          
+          DP[0] = InstructionCost(0);
+          DPPaths[0] = {};
+          
+          for (unsigned i = 1; i < RangeSize; i++) {
+            // 選項 1：不向量化位置 i 的 store
+            if (DP[i - 1] < DP[i]) {
+              DP[i] = DP[i - 1];
+              DPPaths[i] = DPPaths[i - 1];
+            }
+            
+            // 選項 2：向量化一個以位置 i 結尾的切片
+            for (unsigned Size : CandidateVFs) {
+              if (Size > i + 1) continue;
+              
+              unsigned StartPos = i - Size + 1;
+              unsigned j = i;
+              
+              if (!DPCosts[StartPos][j].isValid()) continue;
+              
+              InstructionCost PrevCost = (StartPos > 0) ? DP[StartPos - 1] : InstructionCost(0);
+              InstructionCost CandidateCost = PrevCost + DPCosts[StartPos][j];
+              
+              if (CandidateCost < DP[i]) {
+                DP[i] = CandidateCost;
+                
+                // 構建新路徑
+                DPPaths[i] = (StartPos > 0) ? DPPaths[StartPos - 1] : std::vector<SliceInfo>{};
+                
+                // 添加當前切片到路徑
+                unsigned OrigStartIdx = RangeStart + StartPos;
+                SliceInfo NewSlice(OrigStartIdx, Size, Size, DPCosts[StartPos][j]);
+                DPPaths[i].push_back(NewSlice);
+              }
+            }
+          }
+          
+          // 將這個區間的最佳路徑添加到總路徑
+          TotalDPCost += DP[RangeSize - 1];
+          if (!DPPaths[RangeSize - 1].empty()) {
+            BestDPPath.insert(BestDPPath.end(), 
+                              DPPaths[RangeSize - 1].begin(), 
+                              DPPaths[RangeSize - 1].end());
+          }
+        }
+        
+        return {TotalDPCost, BestDPPath};
+      };
+
+      ///////////////////////////////// 修正後的主算法 /////////////////////////////////
+      // 初始化 RangeSizes
+      // OwningArrayRef<std::pair<unsigned, unsigned>> InitialRangeSizes(Operands.size());
+      std::vector<std::pair<unsigned, unsigned>> InitialRangeSizes(Operands.size(), {1, 1});
+      for (std::pair<unsigned, unsigned> &P : InitialRangeSizes) {
+        P.first = P.second = 1;  // 初始狀態：所有 store 都未向量化
       }
-      ///////////////////////////////// Restore States /////////////////////////////
-      R.restoreState(SS);
-      Ctx.revert();
-      VectorizedStores = VectorizedStoresSS;
-      Changed = ChangedSS;
+
+      // 保存初始狀態
+      BoUpSLP::StateSnapshot InitialSS(R);
+      Ctx.save();
+
+      std::stack<SequenceInfo> ExplorationStack;
+      // InstructionCost BestCost = InstructionCost::getMax();
+      InstructionCost BestCost = InstructionCost(0);
+      std::vector<SliceInfo> BestSequence;
+
+      // 使用 RangeSizes 來找到初始可向量化的切片
+      for (unsigned Size : CandidateVFs) {
+        for (unsigned StartIdx = 0; StartIdx + Size <= Operands.size(); StartIdx++) {
+          
+          if (!CanVectorizeSlice(StartIdx, Size, MaxRegVF, InitialRangeSizes)) {
+            continue;
+          }
+          
+          ArrayRef<Value *> Slice = ArrayRef(Operands).slice(StartIdx, Size);
+          unsigned TreeSize;
+          std::optional<bool> Res = vectorizeStoreChain(Slice, R, StartIdx, MinVF, TreeSize, true, Ctx);
+          R.restoreState(InitialSS); //
+          
+          if (Res && *Res) {
+            SliceInfo InitSlice(StartIdx, Size, Size, sliceCost);
+            std::vector<SliceInfo> EmptyPath;
+            // SequenceInfo InitSeq(std::move(EmptyPath), std::move(InitSlice), InstructionCost(0), InitialRangeSizes);
+            // ExplorationStack.push(std::move(InitSeq));
+            ExplorationStack.emplace(EmptyPath, InitSlice, 
+                               InstructionCost(0), InitialRangeSizes);
+          }
+        }
+      }
+      
+      // 主探索循環
+      while (!ExplorationStack.empty()) {
+        SequenceInfo CurrentSeq = ExplorationStack.top();
+        ExplorationStack.pop();
+        
+        // 重置到初始狀態
+        CandidateVFs = CandidateVFsSS;
+        R.restoreState(InitialSS);
+        Ctx.revert();
+        Ctx.save();
+        
+        // 重放之前的向量化序列並更新 RangeSizes
+        // OwningArrayRef<std::pair<unsigned, unsigned>> CurrentRangeSizes(Operands.size());
+        // std::copy(InitialRangeSizes.begin(), InitialRangeSizes.end(), CurrentRangeSizes.begin());
+        std::vector<std::pair<unsigned, unsigned>> CurrentRangeSizes = InitialRangeSizes;
+        
+        InstructionCost PathCost = CurrentSeq.TotalCost;
+        bool PathReplayFailed = false;
+        for (const SliceInfo& PrevSlice : CurrentSeq.PreviousPath) {
+          ArrayRef<Value *> Slice = ArrayRef(Operands).slice(PrevSlice.StartIdx, PrevSlice.Length);
+          unsigned TreeSize;
+          std::optional<bool> Res = vectorizeStoreChain(Slice, R, PrevSlice.StartIdx, MinVF, TreeSize, false, Ctx);
+          if (!Res || !*Res) {
+            PathReplayFailed = true;
+            break;
+            // goto next_sequence;
+          }
+          
+          // 更新 RangeSizes
+          UpdateRangeSizesAfterVectorization(PrevSlice.StartIdx, PrevSlice.Length, MaxRegVF, CurrentRangeSizes);
+        }
+        if (PathReplayFailed) continue;
+        // 嘗試向量化當前切片
+        {
+          const SliceInfo& CurrentSlice = CurrentSeq.CurrentSlice;
+          
+          // 再次檢查當前切片是否仍然可以向量化
+          if (!CanVectorizeSlice(CurrentSlice.StartIdx, CurrentSlice.Length, MaxRegVF, CurrentRangeSizes)) {
+            // goto next_sequence;
+            continue;
+          }
+          
+          ArrayRef<Value *> Slice = ArrayRef(Operands).slice(CurrentSlice.StartIdx, CurrentSlice.Length);
+          unsigned TreeSize;
+          std::optional<bool> Res = vectorizeStoreChain(Slice, R, CurrentSlice.StartIdx, MinVF, TreeSize, false, Ctx);
+          if (!Res || !*Res) {
+            // goto next_sequence;
+            continue;
+          }
+          
+          // 更新 RangeSizes 和成本
+          UpdateRangeSizesAfterVectorization(CurrentSlice.StartIdx, CurrentSlice.Length, MaxRegVF, CurrentRangeSizes);
+          // PathCost += CurrentSlice.Cost;
+          PathCost += sliceCost;
+        }
+        
+        // 計算剩餘切片的外部依賴
+        auto ExtUsers = CalculateExternalUses(CurrentRangeSizes);
+        
+        // 檢查是否有依賴
+        bool HasDependencies = false;
+        for (unsigned Size : CandidateVFs) {
+          for (unsigned StartIdx = 0; StartIdx + Size <= Operands.size(); StartIdx++) {
+            if (!CanVectorizeSlice(StartIdx, Size, MaxRegVF, CurrentRangeSizes)) {
+              continue;
+            }
+            unsigned EndIdx = StartIdx + Size - 1;
+            if (ExtUsers[StartIdx][EndIdx] > 0) {
+              HasDependencies = true;
+              break;
+            }
+          }
+          if (HasDependencies) break;
+        }
+        
+        // 如果沒有依賴，使用 DP
+        if (!HasDependencies) {
+          // InstructionCost FinalCost = RunDPOnRemaining(CurrentRangeSizes, PathCost);
+          auto [FinalCost, DPPath] = RunDPOnRemaining(CurrentRangeSizes, PathCost);
+          if (FinalCost < BestCost) {
+            BestCost = FinalCost;
+            BestSequence = CurrentSeq.PreviousPath;
+            BestSequence.push_back(CurrentSeq.CurrentSlice);
+            // 添加 DP 找到的路徑
+            BestSequence.insert(BestSequence.end(), DPPath.begin(), DPPath.end());
+            llvm::outs() << "BestSequence:\n";
+            for (const SliceInfo& Slice : BestSequence) {
+              llvm::outs()  << ". Slice [" << Slice.StartIdx << ", " 
+                      << (Slice.StartIdx + Slice.Length - 1) << "] VF=" << Slice.VF 
+                      << " Cost=" << Slice.Cost << "\n";
+            }
+            llvm::outs() << "Found better sequence via DP with cost: " << FinalCost << "\n";
+            llvm::outs() << "Complete sequence has " << BestSequence.size() << " slices\n";
+          }
+          // goto next_sequence;
+          continue;
+        }
+        
+        // 為有依賴的切片創建新序列
+        for (unsigned Size : CandidateVFs) {
+          for (unsigned StartIdx = 0; StartIdx + Size <= Operands.size(); StartIdx++) {
+            
+            if (!CanVectorizeSlice(StartIdx, Size, MaxRegVF, CurrentRangeSizes)) {
+              continue;
+            }
+            
+            unsigned EndIdx = StartIdx + Size - 1;
+            if (ExtUsers[StartIdx][EndIdx] == 0) continue;
+            
+            std::vector<SliceInfo> NewPath = CurrentSeq.PreviousPath;
+            NewPath.push_back(CurrentSeq.CurrentSlice);
+            
+            SliceInfo NewSlice(StartIdx, Size, Size, 0); /// cost should be slicecost not extusers!!!
+            // SequenceInfo NewSeq(NewPath, NewSlice, PathCost, CurrentRangeSizes);
+            
+            // ExplorationStack.push(NewSeq);
+            ExplorationStack.emplace(NewPath, NewSlice, 
+                             PathCost, CurrentRangeSizes);
+          }
+        }
+        
+      // next_sequence:
+      //   continue;
+      }
+
+      // 最後應用最佳序列
+      R.restoreState(InitialSS);
       CandidateVFs = CandidateVFsSS;
-      std::copy(RangeSizes_backup.begin(), RangeSizes_backup.end(), RangeSizes.begin());
-      NonSchedulable = NonSchedulableSS;
-      End = EndSS;
-      Repeat = RepeatSS;
-      ///////////////////////////////// Restore States /////////////////////////////
-      while (true) {
-        ++Repeat;
-        bool RepeatChanged = false;
-        bool AnyProfitableGraph = false;
-        for (unsigned Size : CandidateVFs) {
-          AnyProfitableGraph = false;
-          unsigned StartIdx = std::distance(
-              RangeSizes.begin(),
-              find_if(RangeSizes,
-                      std::bind(IsNotVectorized, Size >= MaxRegVF, _1)));
-          while (StartIdx < End) {
-            unsigned EndIdx = std::distance(
-                RangeSizes.begin(),
-                find_if(RangeSizes.drop_front(StartIdx),
-                        std::bind(IsVectorized, Size >= MaxRegVF, _1)));
-            unsigned Sz = EndIdx >= End ? End : EndIdx;
-            for (unsigned Cnt = StartIdx; Cnt + Size <= Sz;) {
-              if (!checkTreeSizes(RangeSizes.slice(Cnt, Size),
-                                  Size >= MaxRegVF)) {
-                ++Cnt;
-                continue;
-              }
-              ArrayRef<Value *> Slice = ArrayRef(Operands).slice(Cnt, Size);
-              assert(all_of(Slice,
-                            [&](Value *V) {
-                              return cast<StoreInst>(V)
-                                         ->getValueOperand()
-                                         ->getType() ==
-                                     cast<StoreInst>(Slice.front())
-                                         ->getValueOperand()
-                                         ->getType();
-                            }) &&
-                     "Expected all operands of same type.");
-              if (!NonSchedulable.empty()) {
-                auto [NonSchedSizeMax, NonSchedSizeMin] =
-                    NonSchedulable.lookup(Slice.front());
-                if (NonSchedSizeMax > 0 && NonSchedSizeMin <= Size) {
-                  Cnt += NonSchedSizeMax;
-                  continue;
-                }
-              }
-              unsigned TreeSize;
-              // BoUpSLP::StateSnapshot SS(R);
-              // Ctx.save();
-              // LLVM_DEBUG(dbgs() << "@@ first try\n");
-              std::optional<bool> Res =
-                  vectorizeStoreChain(Slice, R, Cnt, MinVF, TreeSize, Ctx);
-              // Ctx.revert();
-              // R.restoreState(SS);
-              // LLVM_DEBUG(dbgs() << "@@ reverted\n");
-              // Res =
-              //     vectorizeStoreChain(Slice, R, Cnt, MinVF, TreeSize, Ctx);
-              // LLVM_DEBUG(dbgs() << "@@ end second try\n");
-              if (!Res) {
-                NonSchedulable
-                    .try_emplace(Slice.front(), std::make_pair(Size, Size))
-                    .first->getSecond()
-                    .second = Size;
-              } else if (*Res) {
-                // Mark the vectorized stores so that we don't vectorize them
-                // again.
-                VectorizedStores.insert_range(Slice);
-                // Mark the vectorized stores so that we don't vectorize them
-                // again.
-                AnyProfitableGraph = RepeatChanged = Changed = true;
-                // If we vectorized initial block, no need to try to vectorize
-                // it again.
-                for (std::pair<unsigned, unsigned> &P :
-                     RangeSizes.slice(Cnt, Size))
-                  P.first = P.second = 0;
-                if (Cnt < StartIdx + MinVF) {
-                  for (std::pair<unsigned, unsigned> &P :
-                       RangeSizes.slice(StartIdx, Cnt - StartIdx))
-                    P.first = P.second = 0;
-                  StartIdx = Cnt + Size;
-                }
-                if (Cnt > Sz - Size - MinVF) {
-                  for (std::pair<unsigned, unsigned> &P :
-                       RangeSizes.slice(Cnt + Size, Sz - (Cnt + Size)))
-                    P.first = P.second = 0;
-                  if (Sz == End)
-                    End = Cnt;
-                  Sz = Cnt;
-                }
-                Cnt += Size;
-                continue;
-              }
-              if (Size > 2 && Res &&
-                  !all_of(RangeSizes.slice(Cnt, Size),
-                          std::bind(VFIsProfitable, Size >= MaxRegVF, TreeSize,
-                                    _1))) {
-                Cnt += Size;
-                continue;
-              }
-              // Check for the very big VFs that we're not rebuilding same
-              // trees, just with larger number of elements.
-              if (Size > MaxRegVF && TreeSize > 1 &&
-                  all_of(RangeSizes.slice(Cnt, Size),
-                         std::bind(FirstSizeSame, TreeSize, _1))) {
-                Cnt += Size;
-                while (Cnt != Sz && RangeSizes[Cnt].first == TreeSize)
-                  ++Cnt;
-                continue;
-              }
-              if (TreeSize > 1)
-                for (std::pair<unsigned, unsigned> &P :
-                     RangeSizes.slice(Cnt, Size)) {
-                  if (Size >= MaxRegVF)
-                    P.second = std::max(P.second, TreeSize);
-                  else
-                    P.first = std::max(P.first, TreeSize);
-                }
-              ++Cnt;
-              AnyProfitableGraph = true;
-            }
-            if (StartIdx >= End)
-              break;
-            if (Sz - StartIdx < Size && Sz - StartIdx >= MinVF)
-              AnyProfitableGraph = true;
-            StartIdx = std::distance(
-                RangeSizes.begin(),
-                find_if(RangeSizes.drop_front(Sz),
-                        std::bind(IsNotVectorized, Size >= MaxRegVF, _1)));
+      Ctx.revert();
+      Ctx.save();
+      if (!BestSequence.empty()) {
+        llvm::outs() << "Applying best sequence with total cost: " << BestCost << "\n";
+        llvm::outs() << "Sequence contains " << BestSequence.size() << " slices:\n";
+        
+        for (size_t i = 0; i < BestSequence.size(); i++) {
+          const SliceInfo& Slice = BestSequence[i];
+          llvm::outs() << "  " << (i + 1) << ". Slice [" << Slice.StartIdx << ", " 
+                      << (Slice.StartIdx + Slice.Length - 1) << "] VF=" << Slice.VF 
+                      << " Cost=" << Slice.Cost << "\n";
+          
+          ArrayRef<Value *> SliceValues = ArrayRef(Operands).slice(Slice.StartIdx, Slice.Length);
+          unsigned TreeSize;
+          std::optional<bool> Res = vectorizeStoreChain(SliceValues, R, Slice.StartIdx, MinVF, TreeSize, false, Ctx);
+          if (Res && *Res) {
+            Changed = true;
+            VectorizedStores.insert_range(SliceValues);
+            llvm::outs() << "    Successfully vectorized with actual cost: " << sliceCost << "\n";
+          } else {
+            llvm::outs() << "    WARNING: Failed to vectorize slice!\n";
           }
-          if (!AnyProfitableGraph && Size >= MaxRegVF && has_single_bit(Size))
-            break;
         }
-        // All values vectorized - exit.
-        if (all_of(RangeSizes, [](const std::pair<unsigned, unsigned> &P) {
-              return P.first == 0 && P.second == 0;
-            }))
-          break;
-        // Check if tried all attempts or no need for the last attempts at all.
-        if (Repeat >= MaxAttempts ||
-            (Repeat > 1 && (RepeatChanged || !AnyProfitableGraph)))
-          break;
-        constexpr unsigned StoresLimit = 64;
-        const unsigned MaxTotalNum = std::min<unsigned>(
-            Operands.size(),
-            static_cast<unsigned>(
-                End -
-                std::distance(
-                    RangeSizes.begin(),
-                    find_if(RangeSizes, std::bind(IsNotVectorized, true, _1))) +
-                1));
-        unsigned VF = bit_ceil(CandidateVFs.front()) * 2;
-        unsigned Limit =
-            getFloorFullVectorNumberOfElements(*TTI, StoreTy, MaxTotalNum);
-        CandidateVFs.clear();
-        if (bit_floor(Limit) == VF)
-          CandidateVFs.push_back(Limit);
-        if (VF > MaxTotalNum || VF >= StoresLimit)
-          break;
-        for (std::pair<unsigned, unsigned> &P : RangeSizes) {
-          if (P.first != 0)
-            P.first = std::max(P.second, P.first);
-        }
-        // Last attempt to vectorize max number of elements, if all previous
-        // attempts were unsuccessful because of the cost issues.
-        CandidateVFs.push_back(VF);
+        
+        llvm::outs() << "Total slices applied: " << BestSequence.size() << "\n";
       }
+
+      Ctx.accept();
+      // ///////////////////////////////// Save States /////////////////////////////
+      // BoUpSLP::StateSnapshot SS(R);
+      // Ctx.save();
+      // BoUpSLP::ValueSet VectorizedStoresSS = VectorizedStores;
+      // bool ChangedSS = Changed;
+      // SmallVector<unsigned> CandidateVFsSS = CandidateVFs;
+      // OwningArrayRef<std::pair<unsigned, unsigned>> RangeSizes_backup(Operands.size());
+      // std::copy(RangeSizes.begin(), RangeSizes.end(), RangeSizes_backup.begin());
+      // DenseMap<Value *, std::pair<unsigned, unsigned>> NonSchedulableSS = NonSchedulable;
+      // unsigned EndSS = End;
+      // unsigned RepeatSS = Repeat;
+      // ///////////////////////////////// Save States /////////////////////////////
+      // while (true) {
+      //   ++Repeat;
+      //   bool RepeatChanged = false;
+      //   bool AnyProfitableGraph = false;
+      //   for (unsigned Size : CandidateVFs) {
+      //     AnyProfitableGraph = false;
+      //     unsigned StartIdx = std::distance(
+      //         RangeSizes.begin(),
+      //         find_if(RangeSizes,
+      //                 std::bind(IsNotVectorized, Size >= MaxRegVF, _1)));
+      //     while (StartIdx < End) {
+      //       unsigned EndIdx = std::distance(
+      //           RangeSizes.begin(),
+      //           find_if(RangeSizes.drop_front(StartIdx),
+      //                   std::bind(IsVectorized, Size >= MaxRegVF, _1)));
+      //       unsigned Sz = EndIdx >= End ? End : EndIdx;
+      //       for (unsigned Cnt = StartIdx; Cnt + Size <= Sz;) {
+      //         if (!checkTreeSizes(RangeSizes.slice(Cnt, Size),
+      //                             Size >= MaxRegVF)) {
+      //           ++Cnt;
+      //           continue;
+      //         }
+      //         ArrayRef<Value *> Slice = ArrayRef(Operands).slice(Cnt, Size);
+      //         assert(all_of(Slice,
+      //                       [&](Value *V) {
+      //                         return cast<StoreInst>(V)
+      //                                    ->getValueOperand()
+      //                                    ->getType() ==
+      //                                cast<StoreInst>(Slice.front())
+      //                                    ->getValueOperand()
+      //                                    ->getType();
+      //                       }) &&
+      //                "Expected all operands of same type.");
+      //         if (!NonSchedulable.empty()) {
+      //           auto [NonSchedSizeMax, NonSchedSizeMin] =
+      //               NonSchedulable.lookup(Slice.front());
+      //           if (NonSchedSizeMax > 0 && NonSchedSizeMin <= Size) {
+      //             Cnt += NonSchedSizeMax;
+      //             continue;
+      //           }
+      //         }
+      //         unsigned TreeSize;
+      //         // BoUpSLP::StateSnapshot SS(R);
+      //         // Ctx.save();
+      //         // LLVM_DEBUG(dbgs() << "@@ first try\n");
+      //         std::optional<bool> Res =
+      //             vectorizeStoreChain(Slice, R, Cnt, MinVF, TreeSize, Ctx);
+      //         // Ctx.revert();
+      //         // R.restoreState(SS);
+      //         // LLVM_DEBUG(dbgs() << "@@ reverted\n");
+      //         // Res =
+      //         //     vectorizeStoreChain(Slice, R, Cnt, MinVF, TreeSize, Ctx);
+      //         // LLVM_DEBUG(dbgs() << "@@ end second try\n");
+      //         if (!Res) {
+      //           NonSchedulable
+      //               .try_emplace(Slice.front(), std::make_pair(Size, Size))
+      //               .first->getSecond()
+      //               .second = Size;
+      //         } else if (*Res) {
+      //           // Mark the vectorized stores so that we don't vectorize them
+      //           // again.
+      //           VectorizedStores.insert_range(Slice);
+      //           // Mark the vectorized stores so that we don't vectorize them
+      //           // again.
+      //           AnyProfitableGraph = RepeatChanged = Changed = true;
+      //           // If we vectorized initial block, no need to try to vectorize
+      //           // it again.
+      //           for (std::pair<unsigned, unsigned> &P :
+      //                RangeSizes.slice(Cnt, Size))
+      //             P.first = P.second = 0;
+      //           if (Cnt < StartIdx + MinVF) {
+      //             for (std::pair<unsigned, unsigned> &P :
+      //                  RangeSizes.slice(StartIdx, Cnt - StartIdx))
+      //               P.first = P.second = 0;
+      //             StartIdx = Cnt + Size;
+      //           }
+      //           if (Cnt > Sz - Size - MinVF) {
+      //             for (std::pair<unsigned, unsigned> &P :
+      //                  RangeSizes.slice(Cnt + Size, Sz - (Cnt + Size)))
+      //               P.first = P.second = 0;
+      //             if (Sz == End)
+      //               End = Cnt;
+      //             Sz = Cnt;
+      //           }
+      //           Cnt += Size;
+      //           continue;
+      //         }
+      //         if (Size > 2 && Res &&
+      //             !all_of(RangeSizes.slice(Cnt, Size),
+      //                     std::bind(VFIsProfitable, Size >= MaxRegVF, TreeSize,
+      //                               _1))) {
+      //           Cnt += Size;
+      //           continue;
+      //         }
+      //         // Check for the very big VFs that we're not rebuilding same
+      //         // trees, just with larger number of elements.
+      //         if (Size > MaxRegVF && TreeSize > 1 &&
+      //             all_of(RangeSizes.slice(Cnt, Size),
+      //                    std::bind(FirstSizeSame, TreeSize, _1))) {
+      //           Cnt += Size;
+      //           while (Cnt != Sz && RangeSizes[Cnt].first == TreeSize)
+      //             ++Cnt;
+      //           continue;
+      //         }
+      //         if (TreeSize > 1)
+      //           for (std::pair<unsigned, unsigned> &P :
+      //                RangeSizes.slice(Cnt, Size)) {
+      //             if (Size >= MaxRegVF)
+      //               P.second = std::max(P.second, TreeSize);
+      //             else
+      //               P.first = std::max(P.first, TreeSize);
+      //           }
+      //         ++Cnt;
+      //         AnyProfitableGraph = true;
+      //       }
+      //       if (StartIdx >= End)
+      //         break;
+      //       if (Sz - StartIdx < Size && Sz - StartIdx >= MinVF)
+      //         AnyProfitableGraph = true;
+      //       StartIdx = std::distance(
+      //           RangeSizes.begin(),
+      //           find_if(RangeSizes.drop_front(Sz),
+      //                   std::bind(IsNotVectorized, Size >= MaxRegVF, _1)));
+      //     }
+      //     if (!AnyProfitableGraph && Size >= MaxRegVF && has_single_bit(Size))
+      //       break;
+      //   }
+      //   // All values vectorized - exit.
+      //   if (all_of(RangeSizes, [](const std::pair<unsigned, unsigned> &P) {
+      //         return P.first == 0 && P.second == 0;
+      //       }))
+      //     break;
+      //   // Check if tried all attempts or no need for the last attempts at all.
+      //   if (Repeat >= MaxAttempts ||
+      //       (Repeat > 1 && (RepeatChanged || !AnyProfitableGraph)))
+      //     break;
+      //   constexpr unsigned StoresLimit = 64;
+      //   const unsigned MaxTotalNum = std::min<unsigned>(
+      //       Operands.size(),
+      //       static_cast<unsigned>(
+      //           End -
+      //           std::distance(
+      //               RangeSizes.begin(),
+      //               find_if(RangeSizes, std::bind(IsNotVectorized, true, _1))) +
+      //           1));
+      //   unsigned VF = bit_ceil(CandidateVFs.front()) * 2;
+      //   unsigned Limit =
+      //       getFloorFullVectorNumberOfElements(*TTI, StoreTy, MaxTotalNum);
+      //   CandidateVFs.clear();
+      //   if (bit_floor(Limit) == VF)
+      //     CandidateVFs.push_back(Limit);
+      //   if (VF > MaxTotalNum || VF >= StoresLimit)
+      //     break;
+      //   for (std::pair<unsigned, unsigned> &P : RangeSizes) {
+      //     if (P.first != 0)
+      //       P.first = std::max(P.second, P.first);
+      //   }
+      //   // Last attempt to vectorize max number of elements, if all previous
+      //   // attempts were unsuccessful because of the cost issues.
+      //   CandidateVFs.push_back(VF);
+      // }
+      // ///////////////////////////////// Restore States /////////////////////////////
+      // R.restoreState(SS);
+      // Ctx.revert();
+      // VectorizedStores = VectorizedStoresSS;
+      // Changed = ChangedSS;
+      // CandidateVFs = CandidateVFsSS;
+      // std::copy(RangeSizes_backup.begin(), RangeSizes_backup.end(), RangeSizes.begin());
+      // NonSchedulable = NonSchedulableSS;
+      // End = EndSS;
+      // Repeat = RepeatSS;
+      // ///////////////////////////////// Restore States /////////////////////////////
+      // while (true) {
+      //   ++Repeat;
+      //   bool RepeatChanged = false;
+      //   bool AnyProfitableGraph = false;
+      //   for (unsigned Size : CandidateVFs) {
+      //     AnyProfitableGraph = false;
+      //     unsigned StartIdx = std::distance(
+      //         RangeSizes.begin(),
+      //         find_if(RangeSizes,
+      //                 std::bind(IsNotVectorized, Size >= MaxRegVF, _1)));
+      //     while (StartIdx < End) {
+      //       unsigned EndIdx = std::distance(
+      //           RangeSizes.begin(),
+      //           find_if(RangeSizes.drop_front(StartIdx),
+      //                   std::bind(IsVectorized, Size >= MaxRegVF, _1)));
+      //       unsigned Sz = EndIdx >= End ? End : EndIdx;
+      //       for (unsigned Cnt = StartIdx; Cnt + Size <= Sz;) {
+      //         if (!checkTreeSizes(RangeSizes.slice(Cnt, Size),
+      //                             Size >= MaxRegVF)) {
+      //           ++Cnt;
+      //           continue;
+      //         }
+      //         ArrayRef<Value *> Slice = ArrayRef(Operands).slice(Cnt, Size);
+      //         assert(all_of(Slice,
+      //                       [&](Value *V) {
+      //                         return cast<StoreInst>(V)
+      //                                    ->getValueOperand()
+      //                                    ->getType() ==
+      //                                cast<StoreInst>(Slice.front())
+      //                                    ->getValueOperand()
+      //                                    ->getType();
+      //                       }) &&
+      //                "Expected all operands of same type.");
+      //         if (!NonSchedulable.empty()) {
+      //           auto [NonSchedSizeMax, NonSchedSizeMin] =
+      //               NonSchedulable.lookup(Slice.front());
+      //           if (NonSchedSizeMax > 0 && NonSchedSizeMin <= Size) {
+      //             Cnt += NonSchedSizeMax;
+      //             continue;
+      //           }
+      //         }
+      //         unsigned TreeSize;
+      //         // BoUpSLP::StateSnapshot SS(R);
+      //         // Ctx.save();
+      //         // LLVM_DEBUG(dbgs() << "@@ first try\n");
+      //         std::optional<bool> Res =
+      //             vectorizeStoreChain(Slice, R, Cnt, MinVF, TreeSize, Ctx);
+      //         // Ctx.revert();
+      //         // R.restoreState(SS);
+      //         // LLVM_DEBUG(dbgs() << "@@ reverted\n");
+      //         // Res =
+      //         //     vectorizeStoreChain(Slice, R, Cnt, MinVF, TreeSize, Ctx);
+      //         // LLVM_DEBUG(dbgs() << "@@ end second try\n");
+      //         if (!Res) {
+      //           NonSchedulable
+      //               .try_emplace(Slice.front(), std::make_pair(Size, Size))
+      //               .first->getSecond()
+      //               .second = Size;
+      //         } else if (*Res) {
+      //           // Mark the vectorized stores so that we don't vectorize them
+      //           // again.
+      //           VectorizedStores.insert_range(Slice);
+      //           // Mark the vectorized stores so that we don't vectorize them
+      //           // again.
+      //           AnyProfitableGraph = RepeatChanged = Changed = true;
+      //           // If we vectorized initial block, no need to try to vectorize
+      //           // it again.
+      //           for (std::pair<unsigned, unsigned> &P :
+      //                RangeSizes.slice(Cnt, Size))
+      //             P.first = P.second = 0;
+      //           if (Cnt < StartIdx + MinVF) {
+      //             for (std::pair<unsigned, unsigned> &P :
+      //                  RangeSizes.slice(StartIdx, Cnt - StartIdx))
+      //               P.first = P.second = 0;
+      //             StartIdx = Cnt + Size;
+      //           }
+      //           if (Cnt > Sz - Size - MinVF) {
+      //             for (std::pair<unsigned, unsigned> &P :
+      //                  RangeSizes.slice(Cnt + Size, Sz - (Cnt + Size)))
+      //               P.first = P.second = 0;
+      //             if (Sz == End)
+      //               End = Cnt;
+      //             Sz = Cnt;
+      //           }
+      //           Cnt += Size;
+      //           continue;
+      //         }
+      //         if (Size > 2 && Res &&
+      //             !all_of(RangeSizes.slice(Cnt, Size),
+      //                     std::bind(VFIsProfitable, Size >= MaxRegVF, TreeSize,
+      //                               _1))) {
+      //           Cnt += Size;
+      //           continue;
+      //         }
+      //         // Check for the very big VFs that we're not rebuilding same
+      //         // trees, just with larger number of elements.
+      //         if (Size > MaxRegVF && TreeSize > 1 &&
+      //             all_of(RangeSizes.slice(Cnt, Size),
+      //                    std::bind(FirstSizeSame, TreeSize, _1))) {
+      //           Cnt += Size;
+      //           while (Cnt != Sz && RangeSizes[Cnt].first == TreeSize)
+      //             ++Cnt;
+      //           continue;
+      //         }
+      //         if (TreeSize > 1)
+      //           for (std::pair<unsigned, unsigned> &P :
+      //                RangeSizes.slice(Cnt, Size)) {
+      //             if (Size >= MaxRegVF)
+      //               P.second = std::max(P.second, TreeSize);
+      //             else
+      //               P.first = std::max(P.first, TreeSize);
+      //           }
+      //         ++Cnt;
+      //         AnyProfitableGraph = true;
+      //       }
+      //       if (StartIdx >= End)
+      //         break;
+      //       if (Sz - StartIdx < Size && Sz - StartIdx >= MinVF)
+      //         AnyProfitableGraph = true;
+      //       StartIdx = std::distance(
+      //           RangeSizes.begin(),
+      //           find_if(RangeSizes.drop_front(Sz),
+      //                   std::bind(IsNotVectorized, Size >= MaxRegVF, _1)));
+      //     }
+      //     if (!AnyProfitableGraph && Size >= MaxRegVF && has_single_bit(Size))
+      //       break;
+      //   }
+      //   // All values vectorized - exit.
+      //   if (all_of(RangeSizes, [](const std::pair<unsigned, unsigned> &P) {
+      //         return P.first == 0 && P.second == 0;
+      //       }))
+      //     break;
+      //   // Check if tried all attempts or no need for the last attempts at all.
+      //   if (Repeat >= MaxAttempts ||
+      //       (Repeat > 1 && (RepeatChanged || !AnyProfitableGraph)))
+      //     break;
+      //   constexpr unsigned StoresLimit = 64;
+      //   const unsigned MaxTotalNum = std::min<unsigned>(
+      //       Operands.size(),
+      //       static_cast<unsigned>(
+      //           End -
+      //           std::distance(
+      //               RangeSizes.begin(),
+      //               find_if(RangeSizes, std::bind(IsNotVectorized, true, _1))) +
+      //           1));
+      //   unsigned VF = bit_ceil(CandidateVFs.front()) * 2;
+      //   unsigned Limit =
+      //       getFloorFullVectorNumberOfElements(*TTI, StoreTy, MaxTotalNum);
+      //   CandidateVFs.clear();
+      //   if (bit_floor(Limit) == VF)
+      //     CandidateVFs.push_back(Limit);
+      //   if (VF > MaxTotalNum || VF >= StoresLimit)
+      //     break;
+      //   for (std::pair<unsigned, unsigned> &P : RangeSizes) {
+      //     if (P.first != 0)
+      //       P.first = std::max(P.second, P.first);
+      //   }
+      //   // Last attempt to vectorize max number of elements, if all previous
+      //   // attempts were unsuccessful because of the cost issues.
+      //   CandidateVFs.push_back(VF);
+      // }
       
     }
   };
+  //greedy+dp version
+  // auto TryToVectorize = [&](const StoreIndexToDistSet &Set) {
 
+  //   llvm::outs() << "      TryToVectorize Set : {";
+  //   for(auto i : Set){
+  //     llvm::outs() << "{" << i.first << ", " << i.second << "}, ";
+  //   }
+  //   llvm::outs() << "} \n";
+
+  //   int PrevDist = -1;
+  //   BoUpSLP::ValueList Operands;
+  //   // Collect the chain into a list.
+  //   for (auto [Idx, Data] : enumerate(Set)) {
+  //     if (Operands.empty() || Data.second - PrevDist == 1) {
+  //       Operands.push_back(Stores[Data.first]);
+
+  //       ////llvm::outs() << "      1: push {" << Data.first << ", " << Data.second << "} \n";  
+
+  //       PrevDist = Data.second;
+  //       if (Idx != Set.size() - 1)
+  //         continue;
+  //     }
+  //     auto E = make_scope_exit([&, &DataVar = Data]() {
+  //       ////llvm::outs() << "      clear operands \n";
+  //       Operands.clear();
+  //       Operands.push_back(Stores[DataVar.first]);
+
+  //       ////llvm::outs() << "      2: push {" << DataVar.first << ", " << DataVar.second << "} \n";
+
+  //       PrevDist = DataVar.second;
+  //     });
+
+  //     if (Operands.size() <= 1 ||
+  //         !Visited
+  //              .insert({Operands.front(),
+  //                       cast<StoreInst>(Operands.front())->getValueOperand(),
+  //                       Operands.back(),
+  //                       cast<StoreInst>(Operands.back())->getValueOperand(),
+  //                       Operands.size()})
+  //              .second)
+  //       continue;
+
+  //     unsigned MaxVecRegSize = R.getMaxVecRegSize();
+  //     unsigned EltSize = R.getVectorElementSize(Operands[0]);
+  //     unsigned MaxElts = llvm::bit_floor(MaxVecRegSize / EltSize);
+
+  //     unsigned MaxVF =
+  //         std::min(R.getMaximumVF(EltSize, Instruction::Store), MaxElts);
+  //     unsigned MaxRegVF = MaxVF;
+  //     auto *Store = cast<StoreInst>(Operands[0]);
+  //     Type *StoreTy = Store->getValueOperand()->getType();
+  //     Type *ValueTy = StoreTy;
+  //     if (auto *Trunc = dyn_cast<TruncInst>(Store->getValueOperand()))
+  //       ValueTy = Trunc->getSrcTy();
+  //     if (ValueTy == StoreTy &&
+  //         R.getVectorElementSize(Store->getValueOperand()) <= EltSize)
+  //       MaxVF = std::min<unsigned>(MaxVF, bit_floor(Operands.size()));
+  //     unsigned MinVF = std::max<unsigned>(
+  //         2, PowerOf2Ceil(TTI->getStoreMinimumVF(
+  //                R.getMinVF(DL->getTypeStoreSizeInBits(StoreTy)), StoreTy,
+  //                ValueTy)));
+
+  //     if (MaxVF < MinVF) {
+  //       LLVM_DEBUG(dbgs() << "SLP: Vectorization infeasible as MaxVF (" << MaxVF
+  //                         << ") < "
+  //                         << "MinVF (" << MinVF << ")\n");
+  //       continue;
+  //     }
+
+  //     unsigned NonPowerOf2VF = 0;
+  //     if (VectorizeNonPowerOf2) {
+  //       // First try vectorizing with a non-power-of-2 VF. At the moment, only
+  //       // consider cases where VF + 1 is a power-of-2, i.e. almost all vector
+  //       // lanes are used.
+  //       unsigned CandVF = Operands.size();
+  //       if (isPowerOf2_32(CandVF + 1) && CandVF <= MaxRegVF)
+  //         NonPowerOf2VF = CandVF;
+  //     }
+
+  //     unsigned Sz = 1 + Log2_32(MaxVF) - Log2_32(MinVF);
+  //     SmallVector<unsigned> CandidateVFs(Sz + (NonPowerOf2VF > 0 ? 1 : 0));
+  //     unsigned Size = MinVF;
+  //     for_each(reverse(CandidateVFs), [&](unsigned &VF) {
+  //       VF = Size > MaxVF ? NonPowerOf2VF : Size;
+  //       Size *= 2;
+  //     });
+
+  //     // llvm::outs() <<"      VFs :" ;
+  //     // for(auto i : CandidateVFs){
+  //     //   llvm::outs() <<" " << i ;   
+  //     // }
+  //     // llvm::outs() << "\n";
+
+  //     unsigned End = Operands.size();
+  //     unsigned Repeat = 0;
+  //     constexpr unsigned MaxAttempts = 4;
+  //     OwningArrayRef<std::pair<unsigned, unsigned>> RangeSizes(Operands.size());
+  //     for_each(RangeSizes, [](std::pair<unsigned, unsigned> &P) {
+  //       P.first = P.second = 1;
+  //     });
+  //     DenseMap<Value *, std::pair<unsigned, unsigned>> NonSchedulable;
+  //     auto IsNotVectorized = [](bool First,
+  //                               const std::pair<unsigned, unsigned> &P) {
+  //       return First ? P.first > 0 : P.second > 0;
+  //     };
+  //     auto IsVectorized = [](bool First,
+  //                            const std::pair<unsigned, unsigned> &P) {
+  //       return First ? P.first == 0 : P.second == 0;
+  //     };
+  //     auto VFIsProfitable = [](bool First, unsigned Size,
+  //                              const std::pair<unsigned, unsigned> &P) {
+  //       return First ? Size >= P.first : Size >= P.second;
+  //     };
+  //     auto FirstSizeSame = [](unsigned Size,
+  //                             const std::pair<unsigned, unsigned> &P) {
+  //       return Size == P.first;
+  //     };
+
+      
+  //       //do optimal slice selection
+  //       std::vector<std::pair<unsigned, unsigned> > selected_slices;
+  //       std::pair<unsigned, unsigned> tmp_slice = std::make_pair(0,0);
+  //       InstructionCost total_cost = 0;
+  //       // Double VF in advance
+  //       // unsigned VF = PowerOf2Ceil(CandidateVFs.front()) * 2;
+  //       // CandidateVFs.push_back(VF);
+        
+        
+  //       // Debug VFs
+  //       llvm::outs() <<"      VFs :" ;
+  //       for(auto i : CandidateVFs){
+  //         llvm::outs() <<" " << i ;   
+  //       }
+  //       llvm::outs() << "\n";
+
+  //       do{
+
+  //       // Debug Operands before vectorization  
+  //       // llvm::outs() << "\n      Before Vectorization, Operands Set : {\n";
+  //       // int count = 0;
+  //       // for(auto i : Operands){
+  //       //   llvm::outs() << "        {"  << count << ". " << *i << "}, \n";
+  //       //   ++count;
+  //       //   }
+  //       // llvm::outs() << "      } \n";
+
+  //       unsigned operandsSize = Operands.size();
+  //       std::vector<std::vector<InstructionCost> > cost(operandsSize, std::vector<InstructionCost>(operandsSize, 0));
+  //       std::vector<std::vector<uint64_t> > extUsers(operandsSize, std::vector<uint64_t>(operandsSize, 0));
+  //       InstructionCost min_cost = 0;
+
+  //       // 1. Calculate the cost and extractCost of all possible slices and record the slice with min. cost
+  //       for(unsigned Size : CandidateVFs){
+  //         for(unsigned StartIdx = 0; StartIdx + Size <= operandsSize; StartIdx ++){
+  //           unsigned EndIdx = StartIdx + Size - 1;
+  //           ArrayRef<Value *> Slice = ArrayRef(Operands).slice(StartIdx, Size);
+
+  //           // llvm::outs() << "      test Slice : {";  
+  //           // for(auto i : Slice){
+  //           //   llvm::outs() << "{" << *i << "}, ";
+  //           // }
+  //           // llvm::outs() << "} \n";
+
+  //           unsigned TreeSize;
+  //           // llvm::outs() << "\nGet the cost of Slice: {" << StartIdx << ", " << EndIdx <<  "}\n";
+  //           std::optional<bool> Res = vectorizeStoreChain(Slice, R, StartIdx, MinVF, TreeSize, true);
+  //           if(!Res) continue;
+  //           if(*Res) {
+  //             cost[StartIdx][EndIdx] = sliceCost;
+  //             extUsers[StartIdx][EndIdx] = num_externalUsers;
+  //             if (sliceCost < min_cost){
+  //               min_cost = sliceCost;
+  //               tmp_slice.first = StartIdx;
+  //               tmp_slice.second = EndIdx;
+  //             }
+  //           }
+  //         }
+  //       }
+
+  //       //  Debug Cost Table
+  //       if (operandsSize){
+  //       llvm::outs() << "cost table : \n";
+  //       for (unsigned i = 0; i < operandsSize; ++i) {
+  //         for (unsigned j = 0; j < operandsSize; ++j) {
+  //             llvm::outs() << cost[i][j] << " ";  
+  //         }
+  //         llvm::outs() << "\n";  
+  //       }
+  //       }
+
+  //       //  Debug extUsers  Table
+  //       if (operandsSize){
+  //       llvm::outs() << "\nextUsers table : \n";
+  //       for (unsigned i = 0; i < operandsSize; ++i) {
+  //         for (unsigned j = 0; j < operandsSize; ++j) {
+  //             llvm::outs() << extUsers[i][j] << " ";  
+  //         }
+  //         llvm::outs() << "\n";  
+  //       }
+  //       }
+        
+  //       // 1.5 find optimal slice selection through DP and backtracking. 
+  //       // If no dependencies between selected slices in backtracking, do DP and terminate.
+  //       std::vector<InstructionCost> DP(operandsSize, 0);
+  //       std::vector<std::vector<std::pair<unsigned, unsigned> > > backtrack(operandsSize);
+  //       for(int i = 1; i < operandsSize; i++){
+  //         InstructionCost bestCost = 0;
+  //         int bestVF = 0;
+  //         for(unsigned Size : CandidateVFs){
+  //           int VF = static_cast<int>(Size);
+  //           if(VF > i + 1) continue;
+  //           InstructionCost tmp_cost = cost[i - VF + 1][i];
+  //           if(i - VF >= 0) tmp_cost += DP[i - VF];
+  //           if(tmp_cost < bestCost){
+  //             bestCost = tmp_cost;
+  //             bestVF = VF;
+  //           }
+  //         }
+  //         if(DP[i - 1] <= bestCost){
+  //           DP[i] = DP[i - 1];
+  //           backtrack[i] = backtrack[i - 1];
+  //           continue;
+  //         }else{
+  //           DP[i] = bestCost;
+  //           if(i - bestVF >= 0) backtrack[i] = backtrack[i - bestVF];
+  //           backtrack[i].push_back(std::make_pair(i - bestVF + 1,i));
+  //         }
+  //       }
+
+  //       // check if dependencies exist in the 
+  //       // by default, dp is enabled.
+  //       int64_t dp_flag = 0;  // 0: dp enabled, other values: dp disabled
+  //       int64_t all_zero = 0; // 0: costs of all slices are all zeros, 1: costs of slices are NOT all zeros
+  //       if(operandsSize){
+  //         for (auto p : backtrack[operandsSize - 1]){
+  //           if (extUsers[p.first][p.second]){
+  //             dp_flag |= extUsers[p.first][p.second];
+  //           }
+  //         }
+
+  //         for (unsigned i = 0; i < operandsSize; ++i) {
+  //           for (unsigned j = 0; j < operandsSize; ++j) {
+  //               if (cost[i][j].getValue()){
+  //                 all_zero |= *cost[i][j].getValue();
+  //               }  
+  //           }
+  //         }
+  //       }
+        
+  //       // llvm::outs() << "dp_flag = " << dp_flag << "\n";
+  //       // llvm::outs() << "all_zero = "<< all_zero << "\n";
+        
+  //       if (!dp_flag && all_zero){
+  //       // do real vectorizeStoreChain according slice selection through DP
+  //       llvm::outs() << "DP is available!!\n";
+  //       llvm::outs() << "bestCost = " << DP[operandsSize - 1] << "\n";
+  //       llvm::outs() << "pattern : \n";
+  //       if(!backtrack[operandsSize - 1].empty()){
+  //         for(auto p : backtrack[operandsSize - 1]){
+  //           llvm::outs() << "{" << p.first << ", " << p.second << "}, ";
+  //           ArrayRef<Value *> Slice = ArrayRef(Operands).slice(p.first, p.second - p.first + 1);
+            
+  //           llvm::outs() << "Slice : {";  
+  //           for(auto i : Slice){
+  //             llvm::outs() << "{" << *i << "}, ";
+  //           }
+  //           llvm::outs() << "} ";
+
+  //           llvm::outs() << "initial slice cost = " << cost[p.first][p.second] << ", ";
+
+  //           unsigned TreeSize;
+  //           std::optional<bool> Res = vectorizeStoreChain(Slice, R, p.first, MinVF, TreeSize, false);
+  //           if(Res){
+  //             if(*Res) {
+  //               llvm::outs() << "slice cost = " << sliceCost << " success\n";
+  //               total_cost += sliceCost;
+                 
+  //               Changed = true;
+  //               for_each(RangeSizes.slice(p.first, p.second - p.first + 1),
+  //                       [](std::pair<unsigned, unsigned> &P) {
+  //                         P.first = P.second = 0;
+  //                       });
+  //             }else{
+  //               llvm::outs() << "slice cost = " << sliceCost << " fail\n";
+  //               // llvm::outs() << "\n      Operands Set checking : {\n";
+  //               // int idx = 0;
+  //               // for(auto i : Operands){
+  //               //   llvm::outs() << "        {"  << idx << ". " << *i << "}, \n";
+  //               //   ++idx;
+  //               //  }
+  //               // llvm::outs() << "      } \n";
+  //             }
+  //           }else{
+  //             llvm::outs() << "can't schedule\n";
+  //           }
+  //         }
+  //       }
+  //       llvm:: outs() << "total_cost = " << total_cost << "\n"; 
+  //       break;
+  //     }
+
+
+
+  //       //  Exit the loop and print out total cost if min_cost == 0
+  //       llvm::outs()<< "min_cost = " << min_cost << "\n";
+  //       if(min_cost == 0) {
+  //         llvm:: outs() << "total_cost = " << total_cost << "\n"; 
+  //         break;
+  //       }
+  //       total_cost += min_cost;
+
+  //       selected_slices.push_back(tmp_slice);
+  //       unsigned idx = selected_slices.size();
+        
+  //       // Debug selected_slices so far
+  //       llvm::outs() << "selected_slices so far:\n";
+  //       for (auto s: selected_slices){
+  //         llvm::outs() << "{"<< s.first << ", " << s.second << "}\n";
+  //       }
+  //       llvm::outs() << "\n";
+
+        
+  //       // 2. do real vectorizeStoreChain according slice selection above
+  //       if(idx){
+  //         // Debug selected slice info
+  //         llvm::outs() << "Selected Slice {" 
+  //         << selected_slices[idx - 1].first << ", " << selected_slices[idx - 1].second << "}: ";
+
+  //         llvm::outs() << "initial slice cost = " 
+  //         << cost[selected_slices[idx - 1].first][selected_slices[idx - 1].second] << ", \n";
+
+  //         ArrayRef<Value *> Slice = ArrayRef(Operands).slice(selected_slices[idx - 1].first, selected_slices[idx - 1].second - selected_slices[idx - 1].first + 1);
+          
+
+  //         unsigned TreeSize;
+  //         std::optional<bool> Res = vectorizeStoreChain(Slice, R, selected_slices[idx - 1].first, MinVF, TreeSize, false);
+  //         if(Res){
+
+  //           if(*Res) {
+  //             BoUpSLP::ValueList tmp;
+  //             if (selected_slices[idx - 1].second == operandsSize - 1){ // // chosen slice is the last VF store instructions
+  //               std::move(Operands.begin(), Operands.begin() + selected_slices[idx - 1].first, std::back_inserter(tmp));
+  //             }
+  //             else if (selected_slices[idx - 1].first == 0){  // chosen slice is the first VF store instructions
+  //               std::move(Operands.begin() + selected_slices[idx - 1].second + 1, Operands.end(), std::back_inserter(tmp));
+  //             }
+  //             else {
+  //             std::move(Operands.begin(), Operands.begin() + selected_slices[idx - 1].first, std::back_inserter(tmp));
+  //             std::move(Operands.begin() + selected_slices[idx - 1].second + 1, Operands.end(), std::back_inserter(tmp));
+  //             }
+
+  //             Operands.clear();
+
+  //             for (auto i: tmp){
+  //               Operands.push_back(i);
+  //             }
+
+  //             Changed = true;
+  //             for_each(RangeSizes.slice(selected_slices[idx - 1].first, selected_slices[idx - 1].second - selected_slices[idx - 1].first + 1),
+  //                       [](std::pair<unsigned, unsigned> &P) {
+  //                         P.first = P.second = 0;
+  //                       });
+
+  //             // llvm::outs() << "\n      After Vectorization, Operands Set checking : {\n";
+  //             // int idx = 0;
+  //             // for(auto i : Operands){
+  //             //   llvm::outs() << "        {"  << idx << ". " << *i << "}, \n";
+  //             //   ++idx;
+  //             // }
+  //             // llvm::outs() << "      } \n";
+  //           }else{
+  //               llvm::outs() << "eventual cost = " << sliceCost << " fail\n";
+
+  //               llvm::outs() << "\n      After Vectorization, Operands Set checking : {\n";
+  //               int idx = 0;
+  //               for(auto i : Operands){
+  //                 llvm::outs() << "        {"  << idx << ". " << *i << "}, \n";
+  //                 ++idx;
+  //                }
+  //               llvm::outs() << "      } \n";
+  //           }
+  //         }else{
+  //           llvm::outs() << "can't schedule\n";
+  //         }
+          
+  //       }
+  //       } while(true);
+  //   }
+  // };
   /// Groups of stores to vectorize
   SmallVector<RelatedStoreInsts> SortedStores;
 
