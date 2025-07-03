@@ -25870,6 +25870,19 @@ bool SLPVectorizerPass::vectorizeStores(
   bool Changed = false;
 
   auto TryToVectorize = [&](const RelatedStoreInsts::DistToInstMap &StoreSeq) {
+
+    llvm::outs() << "TryToVectorize set: {";
+    for (auto i : StoreSeq) {
+      llvm::outs() << "{" << i.first << ", " << i.second << "} ";
+    }
+    llvm::outs() << "}\n";
+
+    LLVM_DEBUG(dbgs() << "TryToVectorize set: {");
+    for (auto i : StoreSeq) {
+      LLVM_DEBUG(dbgs() << "{" << i.first << ", " << i.second << "} ");
+    }
+    LLVM_DEBUG(dbgs() << "}\n");
+
     int PrevDist = -1;
     BoUpSLP::ValueList Operands;
     // Collect the chain into a list.
@@ -25980,6 +25993,10 @@ bool SLPVectorizerPass::vectorizeStores(
                               const std::pair<unsigned, unsigned> &P) {
         return Size == P.first;
       };
+      // Double VF
+      unsigned tempVF = PowerOf2Ceil(CandidateVFs.front())*2;
+      CandidateVFs.push_back(tempVF);
+
       SmallVector<unsigned> CandidateVFsSS = CandidateVFs;
       /// Finding real optimal slice selection via rollback.
       struct SliceInfo {
@@ -26018,10 +26035,10 @@ bool SLPVectorizerPass::vectorizeStores(
         }
         
         // 使用原始的 checkTreeSizes 邏輯
-        ArrayRef<std::pair<unsigned, unsigned>> SubRange(RangeSizes.data() + StartIdx, Size);
-        return checkTreeSizes(SubRange, Size >= MaxRegVF);
+        // ArrayRef<std::pair<unsigned, unsigned>> SubRange(RangeSizes.data() + StartIdx, Size);
+        // return checkTreeSizes(SubRange, Size >= MaxRegVF);
         // diable checkTreeSizes for now
-        // return true;
+        return true;
       };
 
       // 更新 RangeSizes 當一個切片被向量化後
@@ -26038,11 +26055,13 @@ bool SLPVectorizerPass::vectorizeStores(
 
       // 計算外部使用表的修正版本
       auto CalculateExternalUses = [&](const std::vector<std::pair<unsigned, unsigned>>& RangeSizes) 
-        -> std::vector<std::vector<uint64_t>> {
+        -> std::pair<std::vector<std::vector<uint64_t>>, std::vector<std::vector<InstructionCost>>> {
         
         unsigned OperandsSize = Operands.size();
         std::vector<std::vector<uint64_t>> ExtUsers(OperandsSize, 
                                                     std::vector<uint64_t>(OperandsSize, 0));
+        std::vector<std::vector<InstructionCost>> costtable(OperandsSize, 
+                                                    std::vector<InstructionCost>(OperandsSize, InstructionCost(0)));
         
         for (unsigned Size : CandidateVFs) {
           for (unsigned StartIdx = 0; StartIdx + Size <= OperandsSize; StartIdx++) {
@@ -26059,11 +26078,12 @@ bool SLPVectorizerPass::vectorizeStores(
             std::optional<bool> Res = vectorizeStoreChain(Slice, R, StartIdx, MinVF, TreeSize, true, Ctx);
             if (Res && *Res) {
               ExtUsers[StartIdx][EndIdx] = num_externalUsers;
+              costtable[StartIdx][EndIdx] = sliceCost;
             }
           }
         }
         
-        return ExtUsers;
+        return {ExtUsers, costtable};
       };
 
       auto RunDPOnRemaining = [&](const std::vector<std::pair<unsigned, unsigned>>& CurrentRangeSizes, 
@@ -26121,10 +26141,10 @@ bool SLPVectorizerPass::vectorizeStores(
               
               // 檢查這個切片是否可以向量化
               // 手動創建 ArrayRef 而不是使用 slice()
-              ArrayRef<std::pair<unsigned, unsigned>> SubRange(CurrentRangeSizes.data() + OrigStartIdx, Size);
-              if (!checkTreeSizes(SubRange, Size >= MaxRegVF)) {
-                continue;
-              }
+              // ArrayRef<std::pair<unsigned, unsigned>> SubRange(CurrentRangeSizes.data() + OrigStartIdx, Size);
+              // if (!checkTreeSizes(SubRange, Size >= MaxRegVF)) {
+              //   continue;
+              // }
               
               ArrayRef<Value *> Slice = ArrayRef(Operands).slice(OrigStartIdx, Size);
               unsigned TreeSize;
@@ -26207,6 +26227,7 @@ bool SLPVectorizerPass::vectorizeStores(
 
       // 使用 RangeSizes 來找到初始可向量化的切片
       for (unsigned Size : CandidateVFs) {
+        llvm::outs() << "@@ Size: " << Size << "\n";
         for (unsigned StartIdx = 0; StartIdx + Size <= Operands.size(); StartIdx++) {
           
           if (!CanVectorizeSlice(StartIdx, Size, MaxRegVF, InitialRangeSizes)) {
@@ -26284,10 +26305,10 @@ bool SLPVectorizerPass::vectorizeStores(
           // PathCost += CurrentSlice.Cost;
           PathCost += sliceCost;
         }
-        
+        BoUpSLP::StateSnapshot TempSS(R);
         // 計算剩餘切片的外部依賴
-        auto ExtUsers = CalculateExternalUses(CurrentRangeSizes);
-        
+        auto [ExtUsers, costtable] = CalculateExternalUses(CurrentRangeSizes);
+        R.restoreState(TempSS);
         // 檢查是否有依賴
         bool HasDependencies = false;
         for (unsigned Size : CandidateVFs) {
@@ -26341,7 +26362,7 @@ bool SLPVectorizerPass::vectorizeStores(
             std::vector<SliceInfo> NewPath = CurrentSeq.PreviousPath;
             NewPath.push_back(CurrentSeq.CurrentSlice);
             
-            SliceInfo NewSlice(StartIdx, Size, Size, 0); /// cost should be slicecost not extusers!!!
+            SliceInfo NewSlice(StartIdx, Size, Size, costtable[StartIdx][EndIdx]); /// cost should be slicecost not extusers!!!
             // SequenceInfo NewSeq(NewPath, NewSlice, PathCost, CurrentRangeSizes);
             
             // ExplorationStack.push(NewSeq);
