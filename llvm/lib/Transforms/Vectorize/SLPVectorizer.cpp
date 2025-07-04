@@ -25998,8 +25998,8 @@ bool SLPVectorizerPass::vectorizeStores(
         return Size == P.first;
       };
       // Double VF
-      // unsigned tempVF = PowerOf2Ceil(CandidateVFs.front())*2;
-      // CandidateVFs.push_back(tempVF);
+      unsigned tempVF = PowerOf2Ceil(CandidateVFs.front())*2;
+      CandidateVFs.push_back(tempVF);
 
       SmallVector<unsigned> CandidateVFsSS = CandidateVFs;
       /// Finding real optimal slice selection via rollback.
