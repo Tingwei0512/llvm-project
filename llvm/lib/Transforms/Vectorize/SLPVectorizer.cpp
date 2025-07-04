@@ -1363,10 +1363,10 @@ static InstructionsState getSameOpcode(ArrayRef<Value *> VL,
   bool AnyPoison = InstCnt != VL.size();
   // Check MainOp too to be sure that it matches the requirements for the
   // instructions.
-  LLVM_DEBUG(dbgs() << "@@SLP: VL: \n");
-  for (Value *V : iterator_range(It, VL.end())) 
-    LLVM_DEBUG(V->dump());
-  LLVM_DEBUG(dbgs() << "@@SLP: VL end\n");
+  // LLVM_DEBUG(dbgs() << "@@SLP: VL: \n");
+  // for (Value *V : iterator_range(It, VL.end())) 
+  //   LLVM_DEBUG(V->dump());
+  // LLVM_DEBUG(dbgs() << "@@SLP: VL end\n");
   for (Value *V : iterator_range(It, VL.end())) {
     // LLVM_DEBUG(V->dump());
     auto *I = dyn_cast<Instruction>(V);
@@ -1794,7 +1794,8 @@ public:
           AnalyzedReductionsRoots(R.AnalyzedReductionsRoots),
           AnalyzedReductionVals(R.AnalyzedReductionVals),
           AnalyzedMinBWVals(R.AnalyzedMinBWVals),
-          CSEBlocks(R.CSEBlocks) {}
+          CSEBlocks(R.CSEBlocks),
+          GatherShuffleExtractSeq(R.GatherShuffleExtractSeq) {}
 
     StateSnapshot() = delete;
 
@@ -1804,6 +1805,7 @@ public:
     DenseSet<size_t> AnalyzedReductionVals;
     DenseSet<Value *> AnalyzedMinBWVals;
     DenseSet<BasicBlock *> CSEBlocks;
+    SetVector<Instruction *> GatherShuffleExtractSeq;
   };
 
   void saveState(StateSnapshot &State) {
@@ -1813,6 +1815,7 @@ public:
     State.AnalyzedReductionVals = this->AnalyzedReductionVals;
     State.AnalyzedMinBWVals = this->AnalyzedMinBWVals;
     State.CSEBlocks = this->CSEBlocks;
+    State.GatherShuffleExtractSeq = this->GatherShuffleExtractSeq;
   }
 
   void restoreState(StateSnapshot &State) {
@@ -1822,6 +1825,7 @@ public:
     this->AnalyzedReductionVals = State.AnalyzedReductionVals;
     this->AnalyzedMinBWVals = State.AnalyzedMinBWVals;
     this->CSEBlocks = State.CSEBlocks;
+    this->GatherShuffleExtractSeq = State.GatherShuffleExtractSeq;
   }
 
   /// Tracks the state we can represent the loads in the given sequence.
@@ -6150,7 +6154,6 @@ static Value *createInsertVector(
     function_ref<Value *(Value *, Value *, ArrayRef<int>)> Generator = {}) {
   const unsigned SubVecVF = getNumElements(V->getType());
   if (Index % SubVecVF == 0) {
-    LLVM_DEBUG(dbgs() << "@@ get here insertvector\n");
     Vec = Builder.CreateInsertVector(Vec->getType(), Vec, V,
                                      Builder.getInt64(Index));
   } else {
@@ -6238,7 +6241,6 @@ static Value *createExtractVector(IRBuilderBase &Builder, Value *Vec,
   if (Index % SubVecVF == 0) {
     VectorType *SubVecTy =
         getWidenedType(Vec->getType()->getScalarType(), SubVecVF);
-    LLVM_DEBUG(dbgs() << "@@ get here extractvector\n");
     return Builder.CreateExtractVector(SubVecTy, Vec, Builder.getInt64(Index));
   }
   // Create shuffle, extract_subvector requires that index is multiple of
@@ -22334,7 +22336,6 @@ Value *BoUpSLP::vectorizeTree(
 
     Value *Lane = Builder.getInt32(ExternalUse.Lane);
     auto ExtractAndExtendIfNeeded = [&](Value *Vec) {
-      LLVM_DEBUG(dbgs() << "@@ get here extractandextendifneeded\n");
       if (Scalar->getType() != Vec->getType()) {
         Value *Ex = nullptr;
         Value *ExV = nullptr;
@@ -22784,7 +22785,7 @@ Value *BoUpSLP::vectorizeTree(
   // cache correctness.
   // NOTE: removeInstructionAndOperands only marks the instruction for deletion
   // - instructions are not deleted until later.
-  LLVM_DEBUG(dbgs() << "@@ RemovedInsts: \n");
+
   removeInstructionsAndOperands(ArrayRef(RemovedInsts), VectorValuesAndScales);
 
   Builder.ClearInsertionPoint();
@@ -23216,7 +23217,6 @@ Value *BoUpSLP::SBvectorizeTree(
                 !IV || IV == Vec || IV->getParent() != IVec->getParent() ||
                 IV->comesBefore(IVec)) {
                   Ex = Builder.CreateExtractElement(V, ES->getIndexOperand());
-              LLVM_DEBUG(dbgs() << "@@ get here extractelement2\n");
               // for sandboxir
               // if (auto *svi = dyn_cast<ExtractElementInst>(Ex)) 
               //   Ctx.createExtractElementInst(svi);
@@ -23594,7 +23594,11 @@ Value *BoUpSLP::SBvectorizeTree(
       //                       PoisonValue::get(IE->getOperand(1)->getType()));
       sandboxir::Value *SBIE = Ctx.getValue(dyn_cast<Value>(IE));
       sandboxir::Value *SBOp0 = Ctx.getValue(IE->getOperand(0));
+      if (!SBOp0)
+        SBOp0 = Ctx.registerCreatedValue(IE->getOperand(0));
       sandboxir::Value *SBOp1 = Ctx.getValue(IE->getOperand(1));
+      if (!SBOp1)
+        SBOp1 = Ctx.registerCreatedValue(IE->getOperand(1));
       cast<sandboxir::User>(SBIE)->replaceUsesOfWith(SBOp0, sandboxir::PoisonValue::get(SBOp0->getType()));
       cast<sandboxir::User>(SBIE)->replaceUsesOfWith(SBOp1, sandboxir::PoisonValue::get(SBOp1->getType()));
       eraseInstruction(IE);
@@ -25994,8 +25998,8 @@ bool SLPVectorizerPass::vectorizeStores(
         return Size == P.first;
       };
       // Double VF
-      unsigned tempVF = PowerOf2Ceil(CandidateVFs.front())*2;
-      CandidateVFs.push_back(tempVF);
+      // unsigned tempVF = PowerOf2Ceil(CandidateVFs.front())*2;
+      // CandidateVFs.push_back(tempVF);
 
       SmallVector<unsigned> CandidateVFsSS = CandidateVFs;
       /// Finding real optimal slice selection via rollback.
