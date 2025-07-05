@@ -25998,9 +25998,35 @@ bool SLPVectorizerPass::vectorizeStores(
         return Size == P.first;
       };
       // Double VF
-      unsigned tempVF = PowerOf2Ceil(CandidateVFs.front())*2;
-      CandidateVFs.push_back(tempVF);
+      // unsigned tempVF = PowerOf2Ceil(CandidateVFs.front())*2;
+      // CandidateVFs.push_back(tempVF);
 
+      //////////////////// Generate All Possible VF ////////////////////
+      if (!CandidateVFs.empty()) {
+          // **修正點**：從 front() 開始獲取最大 VF
+          unsigned CurrentMaxVF = CandidateVFs.front(); 
+          unsigned MaxTotalNum = Operands.size();
+          constexpr unsigned StoresLimit = 64;
+
+          // 循環擴大 VF，直到達到限制
+          while (true) {
+              unsigned NextVF = bit_ceil(CurrentMaxVF) * 2;
+              if (NextVF <= CurrentMaxVF) break; // 防止無限循環
+              CurrentMaxVF = NextVF;
+
+              if (CurrentMaxVF > MaxTotalNum || CurrentMaxVF >= StoresLimit) break;
+              
+              unsigned Limit = getFloorFullVectorNumberOfElements(*TTI, StoreTy, MaxTotalNum);
+              if (bit_floor(Limit) == CurrentMaxVF) {
+                  if (!is_contained(CandidateVFs, Limit))
+                    CandidateVFs.push_back(Limit);
+              }
+
+              if (!is_contained(CandidateVFs, CurrentMaxVF))
+                CandidateVFs.push_back(CurrentMaxVF);
+          }
+      }
+      //////////////////// Generate All Possible VF ////////////////////
       SmallVector<unsigned> CandidateVFsSS = CandidateVFs;
       /// Finding real optimal slice selection via rollback.
       struct SliceInfo {
